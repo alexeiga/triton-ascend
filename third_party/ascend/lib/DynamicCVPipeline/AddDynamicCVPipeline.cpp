@@ -126,8 +126,6 @@ void AddDynamicCVPipelinePass::runOnOperation()
     addDump("AFTER SplitDataflow");
     pm.addPass(createAnalyzeDataFlowPass());
     addDump("AFTER AnalyzeDataFlow");
-    pm.addPass(createSplitIfByBlockIdPass());
-    addDump("AFTER createSplitIfByBlockIdPass");
     pm.addPass(createSeparateMemoryFromComputePass());
     addDump("AFTER SeparateMemoryFromCompute");
     pm.addPass(createAllocMultiCachePass());
