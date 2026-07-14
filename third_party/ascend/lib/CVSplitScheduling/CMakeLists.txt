@@ -1,5 +1,6 @@
 add_triton_library(CVSplitScheduling
   CVSplitScheduling.cpp
+  PreCheck.cpp
 
   DEPENDS
   CVSplitSchedulingPassIncGen

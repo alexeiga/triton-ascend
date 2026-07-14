@@ -1,4 +1,5 @@
 #include "ascend/include/CVSplitScheduling/CVSplitScheduling.h"
+#include "ascend/include/CVSplitScheduling/PreCheck.h"
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
@@ -91,41 +92,6 @@ static StringRef engineTypeToStr(EngineType e) {
   case EngineType::VECTOR:  return "VECTOR";
   default:                  return "UNKNOWN";
   }
-}
-
-// ============================================================================
-// Stage 1: Find innermost loop
-// ============================================================================
-static scf::ForOp findInnermostLoop(func::FuncOp funcOp) {
-  scf::ForOp innermost = nullptr;
-  funcOp.walk([&](scf::ForOp forOp) {
-    bool hasNestedFor = false;
-    forOp.getBody()->walk([&](scf::ForOp) { hasNestedFor = true; });
-    if (!hasNestedFor)
-      innermost = forOp;
-  });
-  return innermost;
-}
-
-// ============================================================================
-// Stage 1b: Bail-out check — no stores in loop body
-// ============================================================================
-static bool hasStoresInBody(scf::ForOp forOp) {
-  bool found = false;
-  forOp.getBody()->walk([&](Operation *op) {
-    if (isa<memref::StoreOp>(op) || isa<tensor::InsertSliceOp>(op) ||
-        isa<bufferization::MaterializeInDestinationOp>(op)) {
-      found = true;
-      return WalkResult::interrupt();
-    }
-    if (op->getName().getStringRef().contains("store") &&
-        !isa<scf::YieldOp>(op)) {
-      found = true;
-      return WalkResult::interrupt();
-    }
-    return WalkResult::advance();
-  });
-  return found;
 }
 
 // ============================================================================
@@ -3499,39 +3465,23 @@ private:
   void processFunction(func::FuncOp funcOp) {
     llvm::errs() << "[cv-split] Function: " << funcOp.getName() << "\n";
 
-    // Stage 1: Find innermost loop
-    scf::ForOp loop = findInnermostLoop(funcOp);
-    if (!loop) {
-      llvm::errs() << "[cv-split] No innermost loop, skip\n";
+    int K = unrollFactor;
+    FailureOr<scf::ForOp> preCheckResult =
+        preCheckCVSplitScheduling(funcOp, K);
+    if (failed(preCheckResult)) {
+      llvm::errs() << "[cv-split] Pre-check rejected function, skip\n";
       return;
     }
-    llvm::errs() << "[cv-split] Found innermost loop\n";
-
-    // Stage 1b: No-store check
-    if (hasStoresInBody(loop)) {
-      llvm::errs() << "[cv-split] Loop has stores, bail\n";
-      return;
-    }
+    scf::ForOp loop = *preCheckResult;
+    llvm::errs() << "[cv-split] Pre-check accepted candidate loop\n";
 
     // Stage 2: Unroll
-    int K = unrollFactor;
-    if (K <= 1) {
-      llvm::errs() << "[cv-split] unrollFactor<=1, skip\n";
-      return;
-    }
-
     LogicalResult unrollResult = loopUnrollByFactor(loop, K);
     if (failed(unrollResult)) {
       llvm::errs() << "[cv-split] Unroll failed, bail\n";
       return;
     }
     llvm::errs() << "[cv-split] Unrolled by " << K << "\n";
-
-    loop = findInnermostLoop(funcOp);
-    if (!loop) {
-      llvm::errs() << "[cv-split] Lost loop after unroll, bail\n";
-      return;
-    }
 
     Block *body = loop.getBody();
 
