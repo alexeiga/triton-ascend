@@ -4,6 +4,56 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$SCRIPT_DIR/../../../../.." && pwd)"
 TEST="$REPO/third_party/ascend/unittest/Conversion/General/CVSplitScheduling/cv_split_precheck.mlir"
+FA_TEST="$REPO/third_party/ascend/unittest/Conversion/General/CVSplitScheduling/cv_split_scheduling_fa.mlir"
+VERBOSE=false
+
+case "${1:-}" in
+  "") ;;
+  -v|--verbose) VERBOSE=true ;;
+  -h|--help)
+    echo "usage: $0 [--verbose]"
+    exit 0
+    ;;
+  *)
+    echo "error: unknown option: $1" >&2
+    echo "usage: $0 [--verbose]" >&2
+    exit 2
+    ;;
+esac
+
+# Keep pass diagnostics visible, but hide the large IR dump sections emitted on
+# stderr. The transformed IR on stdout is left untouched for FileCheck.
+filter_ir_dumps() {
+  awk '
+    /^\[cv-split\] === (IR|FUNCTION IR)/ { in_dump = 1; next }
+    in_dump && /^\[cv-split\] === END/ { in_dump = 0; next }
+    !in_dump { print }
+  '
+}
+
+show_log_if_verbose() {
+  if $VERBOSE; then
+    filter_ir_dumps <"$1" >&2
+  fi
+}
+
+run_stdout_filecheck() {
+  local input="$1"
+  local unroll="$2"
+  local log="$3"
+  shift 3
+
+  if "$OPT" "$input" \
+      "--cv_split_scheduling=compile-on-910-95=true unroll-factor=$unroll" \
+      2>"$log" | "$FC" "$input" "$@"; then
+    show_log_if_verbose "$log"
+    return 0
+  fi
+
+  echo "    triton-opt diagnostics:" >&2
+  filter_ir_dumps <"$log" >&2
+  return 1
+}
 
 find_triton_opt() {
   if [[ -n "${TRITON_OPT:-}" ]]; then
@@ -67,19 +117,34 @@ echo ">>> CVSplit precheck lit tests"
 echo "    triton-opt: $OPT"
 echo "    FileCheck:  $FC"
 
-"$OPT" "$TEST" \
-  "--cv_split_scheduling=compile-on-910-95=true unroll-factor=4" \
-  2>/dev/null | "$FC" "$TEST" --check-prefix=REJECT
+TMP_DIR="$(mktemp -d)"
+trap 'rm -rf "$TMP_DIR"' EXIT
+
+run_stdout_filecheck "$TEST" 4 "$TMP_DIR/reject.log" --check-prefix=REJECT
 echo "    PASS: rejected unsupported loop structures without transformation"
 
-"$OPT" "$TEST" \
-  "--cv_split_scheduling=compile-on-910-95=true unroll-factor=3" \
-  2>/dev/null | "$FC" "$TEST" --check-prefix=BAD-UNROLL
+run_stdout_filecheck "$TEST" 3 "$TMP_DIR/bad-unroll.log" \
+  --check-prefix=BAD-UNROLL
 echo "    PASS: rejected unsupported unroll factor"
 
-"$OPT" "$TEST" \
-  "--cv_split_scheduling=compile-on-910-95=true unroll-factor=4" \
-  2>&1 >/dev/null | "$FC" "$TEST" --check-prefix=ACCEPT
+ACCEPT_LOG="$TMP_DIR/accept.log"
+if ! "$OPT" "$TEST" \
+    "--cv_split_scheduling=compile-on-910-95=true unroll-factor=4" \
+    >/dev/null 2>"$ACCEPT_LOG"; then
+  echo "    triton-opt diagnostics:" >&2
+  filter_ir_dumps <"$ACCEPT_LOG" >&2
+  exit 1
+fi
+if ! "$FC" "$TEST" --check-prefix=ACCEPT <"$ACCEPT_LOG"; then
+  echo "    triton-opt diagnostics:" >&2
+  filter_ir_dumps <"$ACCEPT_LOG" >&2
+  exit 1
+fi
+show_log_if_verbose "$ACCEPT_LOG"
 echo "    PASS: accepted supported candidate-loop structures"
 
-echo ">>> all CVSplit precheck lit tests passed"
+echo ">>> CVSplit full Flash Attention lit test"
+run_stdout_filecheck "$FA_TEST" 4 "$TMP_DIR/fa.log"
+echo "    PASS: full Flash Attention transformation"
+
+echo ">>> all CVSplit lit tests passed"
