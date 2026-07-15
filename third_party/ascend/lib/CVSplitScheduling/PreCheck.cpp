@@ -5,8 +5,10 @@
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
+#include "mlir/Dialect/Utils/StaticValueUtils.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/Debug.h"
+#include "llvm/Support/MathExtras.h"
 
 #define DEBUG_TYPE "cv-split-pre-check"
 
@@ -81,6 +83,26 @@ static LogicalResult checkStaticTensorShapes(scf::ForOp forOp) {
   return success(!walkResult.wasInterrupted());
 }
 
+static LogicalResult checkStaticDivisibleTripCount(scf::ForOp forOp,
+                                                   int unrollFactor) {
+  std::optional<int64_t> lowerBound =
+      getConstantIntValue(forOp.getLowerBound());
+  std::optional<int64_t> upperBound =
+      getConstantIntValue(forOp.getUpperBound());
+  std::optional<int64_t> step = getConstantIntValue(forOp.getStep());
+  if (!lowerBound || !upperBound || !step || *step <= 0 ||
+      *upperBound <= *lowerBound)
+    return failure();
+
+  int64_t distance;
+  if (llvm::SubOverflow(*upperBound, *lowerBound, distance))
+    return failure();
+
+  int64_t tripCount = distance / *step + (distance % *step != 0);
+  return success(tripCount >= unrollFactor &&
+                 tripCount % unrollFactor == 0);
+}
+
 } // namespace
 
 FailureOr<scf::ForOp>
@@ -108,6 +130,13 @@ mlir::triton::preCheckCVSplitScheduling(func::FuncOp funcOp,
     LLVM_DEBUG(llvm::dbgs()
                << "[cv-split-pre-check] candidate loop contains an unranked "
                   "or dynamically shaped tensor\n");
+    return failure();
+  }
+
+  if (failed(checkStaticDivisibleTripCount(candidate, unrollFactor))) {
+    LLVM_DEBUG(llvm::dbgs()
+               << "[cv-split-pre-check] candidate loop must have a static, "
+                  "positive trip count divisible by the unroll factor\n");
     return failure();
   }
 
