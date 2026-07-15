@@ -140,8 +140,31 @@ if ! "$FC" "$TEST" --check-prefix=ACCEPT <"$ACCEPT_LOG"; then
   filter_ir_dumps <"$ACCEPT_LOG" >&2
   exit 1
 fi
+if ! "$FC" "$TEST" --check-prefix=DIAG <"$ACCEPT_LOG"; then
+  echo "    triton-opt diagnostics:" >&2
+  filter_ir_dumps <"$ACCEPT_LOG" >&2
+  exit 1
+fi
 show_log_if_verbose "$ACCEPT_LOG"
 echo "    PASS: accepted supported candidate-loop structures"
+
+for factor in 2 8; do
+  FACTOR_LOG="$TMP_DIR/factor-$factor.log"
+  if ! "$OPT" "$TEST" \
+      "--cv_split_scheduling=compile-on-910-95=true unroll-factor=$factor" \
+      >/dev/null 2>"$FACTOR_LOG"; then
+    echo "    triton-opt diagnostics:" >&2
+    filter_ir_dumps <"$FACTOR_LOG" >&2
+    exit 1
+  fi
+  if ! "$FC" "$TEST" --check-prefix="FACTOR$factor" <"$FACTOR_LOG"; then
+    echo "    triton-opt diagnostics:" >&2
+    filter_ir_dumps <"$FACTOR_LOG" >&2
+    exit 1
+  fi
+  show_log_if_verbose "$FACTOR_LOG"
+  echo "    PASS: accepted supported unroll factor $factor"
+done
 
 echo ">>> CVSplit full Flash Attention lit test"
 run_stdout_filecheck "$FA_TEST" 4 "$TMP_DIR/fa.log"
