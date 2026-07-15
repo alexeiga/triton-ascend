@@ -6,6 +6,7 @@
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Dialect/Utils/StaticValueUtils.h"
+#include "mlir/Interfaces/ControlFlowInterfaces.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/MathExtras.h"
@@ -35,10 +36,18 @@ static bool containsStore(scf::ForOp forOp) {
             bufferization::MaterializeInDestinationOp>(op))
       return WalkResult::interrupt();
 
-    if (!isa<scf::YieldOp>(op) &&
-        op->getName().getStringRef().contains("store"))
+    if (op->getName().getStringRef().contains("store"))
       return WalkResult::interrupt();
 
+    return WalkResult::advance();
+  });
+  return result.wasInterrupted();
+}
+
+static bool containsBranching(scf::ForOp forOp) {
+  WalkResult result = forOp.getBody()->walk([&](Operation *op) {
+    if (isa<RegionBranchOpInterface>(op) || op->getNumSuccessors() != 0)
+      return WalkResult::interrupt();
     return WalkResult::advance();
   });
   return result.wasInterrupted();
@@ -137,6 +146,12 @@ mlir::triton::preCheckCVSplitScheduling(func::FuncOp funcOp,
     LLVM_DEBUG(llvm::dbgs()
                << "[cv-split-pre-check] candidate loop must have a static, "
                   "positive trip count divisible by the unroll factor\n");
+    return failure();
+  }
+
+  if (containsBranching(candidate)) {
+    LLVM_DEBUG(llvm::dbgs()
+               << "[cv-split-pre-check] candidate loop contains branching\n");
     return failure();
   }
 
