@@ -42,6 +42,45 @@ static bool containsStore(scf::ForOp forOp) {
   return result.wasInterrupted();
 }
 
+static LogicalResult checkStaticTensorType(Type type) {
+  if (!isa<TensorType>(type))
+    return success();
+
+  auto rankedType = dyn_cast<RankedTensorType>(type);
+  return success(rankedType && rankedType.hasStaticShape());
+}
+
+static LogicalResult checkStaticTensorShapes(scf::ForOp forOp) {
+  auto checkValue = [](Value value) {
+    return checkStaticTensorType(value.getType());
+  };
+
+  for (Value initArg : forOp.getInitArgs())
+    if (failed(checkValue(initArg)))
+      return failure();
+
+  for (Value result : forOp.getResults())
+    if (failed(checkValue(result)))
+      return failure();
+
+  for (BlockArgument argument : forOp.getBody()->getArguments())
+    if (failed(checkValue(argument)))
+      return failure();
+
+  WalkResult walkResult = forOp.getBody()->walk([&](Operation *op) {
+    for (Value operand : op->getOperands())
+      if (failed(checkValue(operand)))
+        return WalkResult::interrupt();
+
+    for (Value result : op->getResults())
+      if (failed(checkValue(result)))
+        return WalkResult::interrupt();
+
+    return WalkResult::advance();
+  });
+  return success(!walkResult.wasInterrupted());
+}
+
 } // namespace
 
 FailureOr<scf::ForOp>
@@ -62,7 +101,16 @@ mlir::triton::preCheckCVSplitScheduling(func::FuncOp funcOp,
     return failure();
   }
 
+  // this is the chosen for loop
   scf::ForOp candidate = candidates.front();
+
+  if (failed(checkStaticTensorShapes(candidate))) {
+    LLVM_DEBUG(llvm::dbgs()
+               << "[cv-split-pre-check] candidate loop contains an unranked "
+                  "or dynamically shaped tensor\n");
+    return failure();
+  }
+
   if (containsStore(candidate)) {
     LLVM_DEBUG(llvm::dbgs()
                << "[cv-split-pre-check] candidate loop contains a store\n");
