@@ -4,6 +4,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$SCRIPT_DIR/../../../../.." && pwd)"
 TEST="$REPO/third_party/ascend/unittest/Conversion/General/CVSplitScheduling/cv_split_precheck.mlir"
+SINGLE_CORE_TEST="$REPO/third_party/ascend/unittest/Conversion/General/CVSplitScheduling/cv_split_classification_single_core.mlir"
+MIXED_CORE_TEST="$REPO/third_party/ascend/unittest/Conversion/General/CVSplitScheduling/cv_split_classification_mixed_core.mlir"
 FA_TEST="$REPO/third_party/ascend/unittest/Conversion/General/CVSplitScheduling/cv_split_scheduling_fa.mlir"
 VERBOSE=false
 
@@ -165,6 +167,31 @@ for factor in 2 8; do
   show_log_if_verbose "$FACTOR_LOG"
   echo "    PASS: accepted supported unroll factor $factor"
 done
+
+echo ">>> CVSplit classification lit tests"
+for classification_test in "$SINGLE_CORE_TEST" "$MIXED_CORE_TEST"; do
+  test_name="$(basename "$classification_test" .mlir)"
+  run_stdout_filecheck "$classification_test" 4 \
+    "$TMP_DIR/$test_name-ir.log" --check-prefix=IR
+
+  classification_log="$TMP_DIR/$test_name-diag.log"
+  if ! "$OPT" "$classification_test" \
+      "--cv_split_scheduling=compile-on-910-95=true unroll-factor=4" \
+      >/dev/null 2>"$classification_log"; then
+    echo "    triton-opt diagnostics:" >&2
+    filter_ir_dumps <"$classification_log" >&2
+    exit 1
+  fi
+  if ! "$FC" "$classification_test" --check-prefix=DIAG \
+      <"$classification_log"; then
+    echo "    triton-opt diagnostics:" >&2
+    filter_ir_dumps <"$classification_log" >&2
+    exit 1
+  fi
+  show_log_if_verbose "$classification_log"
+done
+echo "    PASS: rejected single-core loops"
+echo "    PASS: accepted mixed-core loop"
 
 echo ">>> CVSplit full Flash Attention lit test"
 run_stdout_filecheck "$FA_TEST" 4 "$TMP_DIR/fa.log"
