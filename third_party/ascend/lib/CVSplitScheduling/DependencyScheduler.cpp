@@ -37,10 +37,12 @@ static void buildDependencyGraph(
   // can place to_tensor BEFORE copy, causing reads of uninitialized data.
   for (Operation &op : *body) {
     auto copyOp = dyn_cast<memref::CopyOp>(&op);
-    if (!copyOp) continue;
+    if (!copyOp)
+      continue;
     Value dst = copyOp.getTarget();
     for (Operation *user : dst.getUsers()) {
-      if (user == &op || user->getBlock() != body) continue;
+      if (user == &op || user->getBlock() != body)
+        continue;
       if (isa<bufferization::ToTensorOp>(user)) {
         predecessors[user].push_back(&op);
         successors[&op].push_back(user);
@@ -54,6 +56,18 @@ static void buildDependencyGraph(
   // (This is already captured by SSA edges since copy USES the source value.)
 }
 
+static bool validateDependencyGraph(
+    const DenseMap<Operation *, SmallVector<Operation *>> &predecessors) {
+  for (const auto &entry : predecessors) {
+    if (entry.second.empty()) {
+      llvm::errs() << "[cv-split] Invalid empty predecessor entry for "
+                   << entry.first->getName() << ", bail\n";
+      return false;
+    }
+  }
+  return true;
+}
+
 // ============================================================================
 // Stage 5: BFS levelization
 // ============================================================================
@@ -65,7 +79,7 @@ static SmallVector<Operation *> collectRoots(
     if (isa<scf::YieldOp>(&op))
       continue;
     auto it = predecessors.find(&op);
-    if (it == predecessors.end() || it->second.empty())
+    if (it == predecessors.end())
       roots.push_back(&op);
   }
   return roots;
@@ -217,6 +231,8 @@ bool DependencyScheduler::run(
     Block *body,
     const DenseMap<Operation *, EngineType> &classification) {
   buildDependencyGraph(body, predecessors, successors);
+  if (!validateDependencyGraph(predecessors))
+    return false;
 
   SmallVector<Operation *> roots = collectRoots(body, predecessors);
   llvm::errs() << "[cv-split] " << roots.size() << " roots\n";
