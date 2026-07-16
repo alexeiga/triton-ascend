@@ -1,5 +1,6 @@
 add_triton_library(CVSplitScheduling
   CVSplitScheduling.cpp
+  classifyAllOps.cpp
   PreCheck.cpp
 
   DEPENDS
@@ -14,4 +15,5 @@ add_triton_library(CVSplitScheduling
   MLIRSCFDialect
   MLIRSCFTransforms
   MLIRTransforms
+  DynamicCVPipeline
 )

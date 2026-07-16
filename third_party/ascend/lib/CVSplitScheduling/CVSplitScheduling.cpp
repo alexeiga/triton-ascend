@@ -1,4 +1,5 @@
 #include "ascend/include/CVSplitScheduling/CVSplitScheduling.h"
+#include "ascend/include/CVSplitScheduling/classifyAllOps.h"
 #include "ascend/include/CVSplitScheduling/PreCheck.h"
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -84,141 +85,16 @@ using namespace mlir::triton;
 
 namespace {
 
-enum class EngineType { CUBE, VECTOR, UNKNOWN };
+using cv_split::EngineType;
 
 static StringRef engineTypeToStr(EngineType e) {
   switch (e) {
   case EngineType::CUBE:    return "CUBE";
   case EngineType::VECTOR:  return "VECTOR";
-  default:                  return "UNKNOWN";
   }
+  return "INVALID";
 }
 
-// ============================================================================
-// Stage 3: Engine classification
-// ============================================================================
-static EngineType classifyOp(Operation *op,
-                             DenseMap<Operation *, EngineType> &cache) {
-  auto it = cache.find(op);
-  if (it != cache.end())
-    return it->second;
-
-  if (isa<linalg::MatmulOp>(op) || isa<linalg::MatmulTransposeBOp>(op) ||
-      isa<linalg::BatchMatmulOp>(op)) {
-    cache[op] = EngineType::CUBE;
-    return EngineType::CUBE;
-  }
-
-  StringRef opName = op->getName().getStringRef();
-  if (opName.contains("dot") || opName.contains("matmul")) {
-    cache[op] = EngineType::CUBE;
-    return EngineType::CUBE;
-  }
-
-  if (isa<hivm::FixpipeOp>(op)) {
-    cache[op] = EngineType::CUBE;
-    return EngineType::CUBE;
-  }
-
-  if (auto syncSetOp = dyn_cast<hivm::SyncBlockSetOp>(op)) {
-    auto coreType = syncSetOp.getTcoreType().getTcoretype();
-    cache[op] = coreType == hivm::TCoreType::CUBE ? EngineType::CUBE : EngineType::VECTOR;
-    return cache[op];
-  }
-  if (auto syncWaitOp = dyn_cast<hivm::SyncBlockWaitOp>(op)) {
-    auto coreType = syncWaitOp.getTcoreType().getTcoretype();
-    cache[op] = coreType == hivm::TCoreType::CUBE ? EngineType::CUBE : EngineType::VECTOR;
-    return cache[op];
-  }
-  if (isa<hivm::CopyOp>(op)) {
-    cache[op] = EngineType::VECTOR;
-    return EngineType::VECTOR;
-  }
-  if (isa<hivm::ConvertLayoutOp>(op)) {
-    cache[op] = EngineType::CUBE;
-    return EngineType::CUBE;
-  }
-
-  cache[op] = EngineType::VECTOR;
-  return EngineType::VECTOR;
-}
-
-static void classifyAllOps(Block *body,
-                           DenseMap<Operation *, EngineType> &classification) {
-  SmallVector<Operation *> cubeSeeds;
-  for (Operation &op : *body) {
-    if (isa<scf::YieldOp>(&op))
-      continue;
-    EngineType ty = classifyOp(&op, classification);
-    if (ty == EngineType::CUBE)
-      cubeSeeds.push_back(&op);
-  }
-
-  DenseSet<Operation *> visited;
-  std::queue<Operation *> worklist;
-  for (auto *seed : cubeSeeds)
-    worklist.push(seed);
-
-  while (!worklist.empty()) {
-    Operation *op = worklist.front();
-    worklist.pop();
-    if (!visited.insert(op).second)
-      continue;
-
-    for (Value operand : op->getOperands()) {
-      auto *defOp = operand.getDefiningOp();
-      if (!defOp || defOp->getBlock() != body || isa<scf::YieldOp>(defOp))
-        continue;
-
-      bool isDataFeeder =
-          isa<bufferization::ToTensorOp>(defOp) ||
-          isa<linalg::TransposeOp>(defOp) ||
-          isa<linalg::FillOp>(defOp) ||
-          isa<memref::AllocOp>(defOp) ||
-          isa<memref::CopyOp>(defOp) ||
-          isa<memref::SubViewOp>(defOp) ||
-          isa<memref::ReinterpretCastOp>(defOp) ||
-          isa<memref::MemorySpaceCastOp>(defOp) ||
-          isa<tensor::ExtractSliceOp>(defOp) ||
-          defOp->getName().getStringRef().contains("transpose") ||
-          defOp->getName().getStringRef().contains("to_tensor") ||
-          defOp->getName().getStringRef().contains("convert_layout");
-
-      if (isDataFeeder && classification[defOp] != EngineType::CUBE) {
-        classification[defOp] = EngineType::CUBE;
-        worklist.push(defOp);
-      }
-    }
-  }
-
-  for (Operation &op : *body) {
-    if (isa<scf::YieldOp>(&op))
-      continue;
-    if (classification.find(&op) == classification.end())
-      classification[&op] = EngineType::VECTOR;
-  }
-}
-
-// Diagnostic: log the per-op CUBE/VECTOR classification and return the CUBE op
-// count (the pass bails when there are no CUBE ops to separate).
-static int logClassification(
-    Block *body, const DenseMap<Operation *, EngineType> &classification) {
-  int nCube = 0, nVec = 0;
-  for (auto &kv : classification) {
-    if (kv.second == EngineType::CUBE) ++nCube;
-    else ++nVec;
-  }
-  llvm::errs() << "[cv-split] Classification: " << nCube << "C " << nVec << "V\n";
-  for (Operation &op : *body) {
-    if (isa<scf::YieldOp>(&op)) continue;
-    auto it = classification.find(&op);
-    llvm::errs() << "[cv-split]   "
-                 << (it != classification.end()
-                     ? engineTypeToStr(it->second) : "??")
-                 << " " << op.getName() << "\n";
-  }
-  return nCube;
-}
 
 // ============================================================================
 // Stage 4: Dependency graph
@@ -1378,7 +1254,7 @@ static void stripWrongTypeOps(scope::ScopeOp scopeOp, EngineType keepType,
     if (isa<memref::ReinterpretCastOp, memref::CopyOp, memref::MemorySpaceCastOp>(&op)) {
       auto it = scopeClassification.find(&op);
       EngineType opType = (it != scopeClassification.end()) ? it->second : EngineType::VECTOR;
-      if (opType == keepType || opType == EngineType::UNKNOWN)
+      if (opType == keepType)
         continue;
       topLevelToErase.push_back(&op);
       continue;
@@ -1387,7 +1263,7 @@ static void stripWrongTypeOps(scope::ScopeOp scopeOp, EngineType keepType,
     // Use scope-level classification (from BFS)
     auto it = scopeClassification.find(&op);
     EngineType opType = (it != scopeClassification.end()) ? it->second : EngineType::VECTOR;
-    if (opType != keepType && opType != EngineType::UNKNOWN) {
+    if (opType != keepType) {
       topLevelToErase.push_back(&op);
     }
   }
@@ -1442,7 +1318,7 @@ static void stripWrongTypeOps(scope::ScopeOp scopeOp, EngineType keepType,
       if (isa<memref::ReinterpretCastOp, memref::CopyOp, memref::MemorySpaceCastOp>(&op)) {
         auto it = scopeClassification.find(&op);
         EngineType opType = (it != scopeClassification.end()) ? it->second : EngineType::VECTOR;
-        if (opType == keepType || opType == EngineType::UNKNOWN)
+        if (opType == keepType)
           continue;
         toErase.push_back(&op);
         continue;
@@ -1451,7 +1327,7 @@ static void stripWrongTypeOps(scope::ScopeOp scopeOp, EngineType keepType,
       // Use scope-level BFS classification
       auto it = scopeClassification.find(&op);
       EngineType opType = (it != scopeClassification.end()) ? it->second : EngineType::VECTOR;
-      if (opType != keepType && opType != EngineType::UNKNOWN)
+      if (opType != keepType)
         toErase.push_back(&op);
     }
 
@@ -3451,6 +3327,8 @@ public:
       processFunction(funcOp);
     });
 
+    cv_split::removeDCVPClassificationAttrs(moduleOp);
+
     llvm::errs() << "\n[cv-split] ============================\n"
                  << "[cv-split]  CVSplitScheduling END\n"
                  << "[cv-split] ============================\n\n";
@@ -3486,10 +3364,18 @@ private:
     Block *body = loop.getBody();
 
     // Stage 3: Classification
-    DenseMap<Operation *, EngineType> classification;
-    classifyAllOps(body, classification);
-    if (logClassification(body, classification) == 0) {
-      llvm::errs() << "[cv-split] No CUBE ops, skip\n";
+    ModuleOp module = funcOp->getParentOfType<ModuleOp>();
+    FailureOr<cv_split::Classification> classificationResult =
+        cv_split::classifyAllOpsWithDCVP(module, body);
+    if (failed(classificationResult)) {
+      llvm::errs() << "[cv-split] DCVP classification failed, bail\n";
+      return;
+    }
+    cv_split::Classification classification =
+        std::move(*classificationResult);
+    if (!cv_split::checkCoreClassifications(body, classification)) {
+      llvm::errs() << "[cv-split] Loop must contain both CUBE and VECTOR ops, "
+                      "skip\n";
       return;
     }
 
