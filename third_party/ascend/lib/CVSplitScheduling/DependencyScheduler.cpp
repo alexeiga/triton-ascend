@@ -3,7 +3,6 @@
 #include "mlir/Dialect/Bufferization/IR/Bufferization.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
-#include "llvm/ADT/DenseSet.h"
 #include "llvm/Support/raw_ostream.h"
 
 #include <algorithm>
@@ -33,7 +32,7 @@ static void buildDependencyGraph(
 
   // Add memory dependency edges: memref.copy → bufferization.to_tensor
   // memref.copy writes to an alloc via side effect (no SSA result).
-  // to_tensor reads from the same alloc. Without this edge, BFS leveling
+  // to_tensor reads from the same alloc. Without this edge, dependency leveling
   // can place to_tensor BEFORE copy, causing reads of uninitialized data.
   for (Operation &op : *body) {
     auto copyOp = dyn_cast<memref::CopyOp>(&op);
@@ -69,7 +68,7 @@ static bool validateDependencyGraph(
 }
 
 // ============================================================================
-// Stage 5: BFS levelization
+// Stage 5: Dependency level assignment
 // ============================================================================
 static SmallVector<Operation *> collectRoots(
     Block *body,
@@ -79,13 +78,15 @@ static SmallVector<Operation *> collectRoots(
     if (isa<scf::YieldOp>(&op))
       continue;
     auto it = predecessors.find(&op);
-    if (it == predecessors.end())
+    if (it == predecessors.end()) {
       roots.push_back(&op);
+      llvm::errs() << "[cv-split] Root: " << op.getName() << "\n";
+    }
   }
   return roots;
 }
 
-static int bfsLevelize(
+static int assignDependencyLevels(
     Block *body,
     const DenseMap<Operation *, SmallVector<Operation *>> &predecessors,
     const SmallVector<Operation *> &roots,
@@ -103,23 +104,24 @@ static int bfsLevelize(
         continue;
 
       auto it = predecessors.find(&op);
-      if (it == predecessors.end()) {
-        if (!levels.count(&op)) {
-          levels[&op] = 0;
-          changed = true;
-        }
+      if (it == predecessors.end())
         continue;
-      }
 
       int requiredLevel = 0;
+      bool allPredecessorsReady = true;
       for (auto *pred : it->second) {
         auto predIt = levels.find(pred);
-        if (predIt != levels.end())
-          requiredLevel = std::max(requiredLevel, predIt->second + 1);
+        if (predIt == levels.end()) {
+          allPredecessorsReady = false;
+          break;
+        }
+        requiredLevel = std::max(requiredLevel, predIt->second + 1);
       }
+      if (!allPredecessorsReady)
+        continue;
 
       auto lvlIt = levels.find(&op);
-      if (lvlIt == levels.end() || requiredLevel > lvlIt->second) {
+      if (lvlIt == levels.end()) {
         levels[&op] = requiredLevel;
         maxLevel = std::max(maxLevel, requiredLevel);
         changed = true;
@@ -130,66 +132,50 @@ static int bfsLevelize(
   return maxLevel;
 }
 
-// ============================================================================
-// Stage 6: Level purity check
-// ============================================================================
-static bool checkLevelPurity(
-    Block *body,
-    const DenseMap<Operation *, int> &levels,
-    const DenseMap<Operation *, EngineType> &classification,
-    const DenseMap<Operation *, SmallVector<Operation *>> &predecessors,
-    int maxLevel) {
-  for (int lvl = 0; lvl <= maxLevel; ++lvl) {
-    SmallVector<Operation *> cubeOps, vectorOps;
-    for (Operation &op : *body) {
-      if (isa<scf::YieldOp>(&op)) continue;
-      auto lvlIt = levels.find(&op);
-      if (lvlIt == levels.end() || lvlIt->second != lvl) continue;
-      auto classIt = classification.find(&op);
-      if (classIt == classification.end()) continue;
-      if (classIt->second == EngineType::CUBE)
-        cubeOps.push_back(&op);
-      else
-        vectorOps.push_back(&op);
-    }
-
-    if (cubeOps.empty() || vectorOps.empty())
+static bool verifyDependencyLevels(
+    Block *body, const DenseMap<Operation *, int> &levels) {
+  for (Operation &op : *body) {
+    if (isa<scf::YieldOp>(&op))
       continue;
-
-    llvm::errs() << "[cv-split] Level " << lvl << " mixed ("
-                 << cubeOps.size() << "C, " << vectorOps.size() << "V)\n";
-
-    DenseSet<Operation *> cubeSet(cubeOps.begin(), cubeOps.end());
-    DenseSet<Operation *> vectorSet(vectorOps.begin(), vectorOps.end());
-
-    for (auto *cOp : cubeOps) {
-      auto predIt = predecessors.find(cOp);
-      if (predIt == predecessors.end()) continue;
-      for (auto *pred : predIt->second) {
-        if (vectorSet.count(pred)) {
-          llvm::errs() << "[cv-split] Level " << lvl
-                       << ": CUBE depends on VECTOR -- bail\n";
-          return false;
-        }
-      }
-    }
-    for (auto *vOp : vectorOps) {
-      auto predIt = predecessors.find(vOp);
-      if (predIt == predecessors.end()) continue;
-      for (auto *pred : predIt->second) {
-        if (cubeSet.count(pred)) {
-          llvm::errs() << "[cv-split] Level " << lvl
-                       << ": VECTOR depends on CUBE -- bail\n";
-          return false;
-        }
-      }
+    if (!levels.count(&op)) {
+      llvm::errs() << "[cv-split] No dependency level assigned to " << op.getName()
+                   << "; dependency graph may contain a cycle, bail\n";
+      return false;
     }
   }
   return true;
 }
 
 // ============================================================================
-// Stage 7: Reorder by BFS level
+// Stage 6: Level diagnostics
+// ============================================================================
+static void logLevelHistogram(
+    Block *body,
+    const DenseMap<Operation *, int> &levels,
+    const DenseMap<Operation *, EngineType> &classification,
+    int maxLevel) {
+  for (int lvl = 0; lvl <= maxLevel; ++lvl) {
+    SmallVector<Operation *> cubeOps, vectorOps;
+    for (Operation &op : *body) {
+      if (isa<scf::YieldOp>(&op))
+        continue;
+      auto lvlIt = levels.find(&op);
+      if (lvlIt->second != lvl)
+        continue;
+      auto classIt = classification.find(&op);
+      if (classIt->second == EngineType::CUBE)
+        cubeOps.push_back(&op);
+      else
+        vectorOps.push_back(&op);
+    }
+
+    llvm::errs() << "[cv-split]   L" << lvl << ": " << cubeOps.size()
+                 << "C " << vectorOps.size() << "V\n";
+  }
+}
+
+// ============================================================================
+// Stage 7: Reorder by dependency level
 // ============================================================================
 static void reorderByLevel(Block *body,
                            const DenseMap<Operation *, int> &levels) {
@@ -200,12 +186,7 @@ static void reorderByLevel(Block *body,
   }
 
   llvm::stable_sort(ops, [&](Operation *a, Operation *b) {
-    int la = 0, lb = 0;
-    auto itA = levels.find(a);
-    if (itA != levels.end()) la = itA->second;
-    auto itB = levels.find(b);
-    if (itB != levels.end()) lb = itB->second;
-    return la < lb;
+    return levels.lookup(a) < levels.lookup(b);
   });
 
   Operation *yield = body->getTerminator();
@@ -219,13 +200,11 @@ static void reorderByLevel(Block *body,
 // Orchestrates stages 4-7 over an (already unrolled) loop body:
 //   1. build a def->use dependency graph (SSA edges + memref.copy->to_tensor
 //      memory edges),
-//   2. assign every op a BFS "level" = longest dependency depth from a root,
-//   3. verify the levels are cleanly separable (no level contains a CUBE op and
-//      a VECTOR op that depend on each other),
-//   4. reorder the body by level so same-engine work is grouped, ready to be
+//   2. assign every op a level = longest dependency depth from a root,
+//   3. report the per-level CUBE/VECTOR distribution,
+//   4. reorder the body by level, ready to be
 //      split into a CUBE scope and a VECTOR scope.
-// run() returns false (leaving the body untouched) when the work is entangled
-// and cannot be cleanly separated, so the caller can bail safely.
+// run() returns false when dependency levels cannot be assigned to every op.
 // ============================================================================
 bool DependencyScheduler::run(
     Block *body,
@@ -237,39 +216,16 @@ bool DependencyScheduler::run(
   SmallVector<Operation *> roots = collectRoots(body, predecessors);
   llvm::errs() << "[cv-split] " << roots.size() << " roots\n";
 
-  maxLevel = bfsLevelize(body, predecessors, roots, levels);
-  llvm::errs() << "[cv-split] " << (maxLevel + 1) << " BFS levels\n";
-  logLevelHistogram(body, classification);
-
-  if (!checkLevelPurity(body, levels, classification, predecessors,
-                        maxLevel)) {
-    llvm::errs() << "[cv-split] Purity check failed, bail\n";
+  maxLevel = assignDependencyLevels(body, predecessors, roots, levels);
+  if (!verifyDependencyLevels(body, levels))
     return false;
-  }
-  llvm::errs() << "[cv-split] Purity OK\n";
+  llvm::errs() << "[cv-split] " << (maxLevel + 1) << " dependency levels\n";
+
+  logLevelHistogram(body, levels, classification, maxLevel);
 
   reorderByLevel(body, levels);
   llvm::errs() << "[cv-split] Reordered by level\n";
   return true;
-}
-
-// Per-level CUBE/VECTOR op-count breakdown (diagnostic only).
-void DependencyScheduler::logLevelHistogram(
-    Block *body,
-    const DenseMap<Operation *, EngineType> &classification) const {
-  for (int lvl = 0; lvl <= maxLevel; ++lvl) {
-    int nC = 0, nV = 0;
-    for (Operation &op : *body) {
-      if (isa<scf::YieldOp>(&op)) continue;
-      auto lvlIt = levels.find(&op);
-      if (lvlIt == levels.end() || lvlIt->second != lvl) continue;
-      auto clsIt = classification.find(&op);
-      if (clsIt == classification.end()) continue;
-      if (clsIt->second == EngineType::CUBE) ++nC; else ++nV;
-    }
-    llvm::errs() << "[cv-split]   L" << lvl << ": "
-                 << nC << "C " << nV << "V\n";
-  }
 }
 
 } // namespace mlir::triton::cv_split

@@ -18,10 +18,6 @@ private:
   llvm::DenseMap<Operation *, llvm::SmallVector<Operation *>> successors;
   llvm::DenseMap<Operation *, int> levels;
   int maxLevel = 0;
-
-  void logLevelHistogram(
-      Block *body,
-      const llvm::DenseMap<Operation *, EngineType> &classification) const;
 };
 
 } // namespace mlir::triton::cv_split
