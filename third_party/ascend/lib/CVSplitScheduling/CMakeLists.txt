@@ -3,6 +3,7 @@ add_triton_library(CVSplitScheduling
   classifyAllOps.cpp
   DependencyScheduler.cpp
   PreCheck.cpp
+  UnfusePVMatmuls.cpp
 
   DEPENDS
   CVSplitSchedulingPassIncGen

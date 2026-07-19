@@ -2,6 +2,7 @@
 
 #include "mlir/Dialect/Bufferization/IR/Bufferization.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
@@ -92,6 +93,19 @@ static LogicalResult checkStaticTensorShapes(scf::ForOp forOp) {
   return success(!walkResult.wasInterrupted());
 }
 
+static LogicalResult checkMatmulOutsAreRankedTensors(scf::ForOp forOp) {
+  for (Operation &op : *forOp.getBody()) {
+    auto matmulOp = dyn_cast<linalg::MatmulOp>(op);
+    if (!matmulOp)
+      continue;
+
+    Value outs = matmulOp.getDpsInitOperand(0)->get();
+    if (!isa<RankedTensorType>(outs.getType()))
+      return failure();
+  }
+  return success();
+}
+
 static LogicalResult checkStaticDivisibleTripCount(scf::ForOp forOp,
                                                    int unrollFactor) {
   std::optional<int64_t> lowerBound =
@@ -139,6 +153,13 @@ mlir::triton::preCheckCVSplitScheduling(func::FuncOp funcOp,
     LLVM_DEBUG(llvm::dbgs()
                << "[cv-split-pre-check] candidate loop contains an unranked "
                   "or dynamically shaped tensor\n");
+    return failure();
+  }
+
+  if (failed(checkMatmulOutsAreRankedTensors(candidate))) {
+    LLVM_DEBUG(llvm::dbgs()
+               << "[cv-split-pre-check] linalg.matmul outs must be a ranked "
+                  "tensor\n");
     return failure();
   }
 

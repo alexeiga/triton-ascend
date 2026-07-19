@@ -1,7 +1,8 @@
 #include "ascend/include/CVSplitScheduling/CVSplitScheduling.h"
 #include "ascend/include/CVSplitScheduling/DependencyScheduler.h"
-#include "ascend/include/CVSplitScheduling/classifyAllOps.h"
 #include "ascend/include/CVSplitScheduling/PreCheck.h"
+#include "ascend/include/CVSplitScheduling/UnfusePVMatmuls.h"
+#include "ascend/include/CVSplitScheduling/classifyAllOps.h"
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
@@ -534,74 +535,6 @@ static void insertCrossScopeTransfers(
                << " transfers with " << cvFlagCounter << " C->V + "
                << vcFlagCounter << " V->C sync flags, "
                << markAllocIndex << " tightly-coupled pairs\n";
-}
-
-// ============================================================================
-// Stage 7.5: Unfuse PV matmuls (split matmul(p,v,acc*alpha) into
-//   pv = matmul(p,v,zeros) + combined = arith.addf(pv, acc*alpha))
-// This is needed because triton's combine pass fuses arith.addf(matmul(...,0), x)
-// into matmul(..., x), creating an unresolvable CUBE→VECTOR→CUBE chain through
-// the accumulator. Unfusing makes the PV matmul independent of the accumulator.
-// ============================================================================
-static void unfusePVMatmuls(Block *body,
-                            DenseMap<Operation *, EngineType> &classification) {
-  SmallVector<linalg::MatmulOp> toUnfuse;
-  for (Operation &op : *body) {
-    auto matmulOp = dyn_cast<linalg::MatmulOp>(&op);
-    if (!matmulOp) continue;
-    auto classIt = classification.find(&op);
-    if (classIt == classification.end() || classIt->second != EngineType::CUBE)
-      continue;
-
-    // Check if outs (operand index getDpsInitOperand(0)) is non-zero
-    // The outs value is the DPS init — if it's a constant zero, skip
-    Value outsVal = matmulOp.getDpsInitOperand(0)->get();
-    auto outsType = dyn_cast<RankedTensorType>(outsVal.getType());
-    if (!outsType) continue;
-
-    // Check if outs is produced by a VECTOR op (e.g. arith.mulf for acc*alpha)
-    Operation *outsDef = outsVal.getDefiningOp();
-    if (!outsDef) continue;
-    auto outsClassIt = classification.find(outsDef);
-    if (outsClassIt == classification.end()) continue;
-    if (outsClassIt->second != EngineType::VECTOR) continue;
-
-    // This is a fused PV matmul with VECTOR-produced accumulator init
-    toUnfuse.push_back(matmulOp);
-  }
-
-  if (toUnfuse.empty()) return;
-
-  llvm::errs() << "[cv-split] Unfusing " << toUnfuse.size()
-               << " PV matmuls with VECTOR outs\n";
-
-  for (auto matmulOp : toUnfuse) {
-    OpBuilder builder(matmulOp);
-    Location loc = matmulOp.getLoc();
-
-    Value outsVal = matmulOp.getDpsInitOperand(0)->get();
-    auto outsType = cast<RankedTensorType>(outsVal.getType());
-
-    // Create zero init tensor
-    auto zeroAttr = builder.getZeroAttr(outsType.getElementType());
-    auto zeroConst = builder.create<arith::ConstantOp>(loc, outsType,
-        DenseElementsAttr::get(outsType, zeroAttr));
-
-    // Replace outs with zeros in the matmul
-    matmulOp.getDpsInitOperand(0)->set(zeroConst.getResult());
-
-    // Insert arith.addf after matmul: combined = matmul_result + original_outs
-    builder.setInsertionPointAfter(matmulOp);
-    Value matResult = matmulOp.getResult(0);
-    auto addOp = builder.create<arith::AddFOp>(loc, matResult, outsVal);
-
-    // Replace all uses of the original matmul result (except the addf itself)
-    matResult.replaceAllUsesExcept(addOp.getResult(), addOp);
-
-    // Classify new ops
-    classification[zeroConst] = EngineType::VECTOR;
-    classification[addOp] = EngineType::VECTOR;
-  }
 }
 
 // ============================================================================
@@ -3141,7 +3074,7 @@ private:
     llvm::errs() << "\n[cv-split] === END IR BEFORE ===\n\n";
 
     // Stage 7.5: Unfuse PV matmuls (split matmul(p,v,acc*alpha) into pv + addf)
-    unfusePVMatmuls(body, classification);
+    cv_split::unfusePVMatmuls(body, classification);
 
     // Stage 8: Insert cross-scope transfers (BEFORE scope separation)
     llvm::errs() << "[cv-split] === Stage 8: cross-scope transfers ===\n";

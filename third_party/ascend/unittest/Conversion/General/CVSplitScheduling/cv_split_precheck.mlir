@@ -284,3 +284,40 @@ func.func @materialize_inside_candidate(%dst: memref<4x8xf32>) {
   }
   return
 }
+
+// Buffer-semantics matmul is unsupported because PV unfusing constructs tensor
+// results and must be rejected before the candidate loop is mutated.
+// REJECT-LABEL: func.func @memref_matmul_out
+// REJECT: linalg.matmul
+// DIAG: [cv-split] Function: memref_matmul_out
+// DIAG-NEXT: [cv-split] Pre-check rejected function, skip
+func.func @memref_matmul_out(
+    %lhs: memref<4x4xf32>, %rhs: memref<4x4xf32>,
+    %out: memref<4x4xf32>) {
+  %c0 = arith.constant 0 : index
+  %c1 = arith.constant 1 : index
+  %c16 = arith.constant 16 : index
+  scf.for %iv = %c0 to %c16 step %c1 {
+    linalg.matmul ins(%lhs, %rhs : memref<4x4xf32>, memref<4x4xf32>)
+        outs(%out : memref<4x4xf32>)
+  }
+  return
+}
+
+// Tensor-semantics matmul with a ranked tensor destination is supported.
+// ACCEPT: [cv-split] Function: ranked_tensor_matmul_out
+// ACCEPT-NEXT: [cv-split] Pre-check accepted candidate loop
+func.func @ranked_tensor_matmul_out() {
+  %c0 = arith.constant 0 : index
+  %c1 = arith.constant 1 : index
+  %c16 = arith.constant 16 : index
+  %lhs = tensor.empty() : tensor<4x4xf32>
+  %rhs = tensor.empty() : tensor<4x4xf32>
+  %out = tensor.empty() : tensor<4x4xf32>
+  scf.for %iv = %c0 to %c16 step %c1 {
+    %result = linalg.matmul
+        ins(%lhs, %rhs : tensor<4x4xf32>, tensor<4x4xf32>)
+        outs(%out : tensor<4x4xf32>) -> tensor<4x4xf32>
+  }
+  return
+}
