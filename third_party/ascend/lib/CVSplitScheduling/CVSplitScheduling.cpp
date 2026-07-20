@@ -2,6 +2,7 @@
 #include "ascend/include/CVSplitScheduling/CrossScopeTransfers.h"
 #include "ascend/include/CVSplitScheduling/DependencyScheduler.h"
 #include "ascend/include/CVSplitScheduling/PreCheck.h"
+#include "ascend/include/CVSplitScheduling/UnrollOrigin.h"
 #include "ascend/include/CVSplitScheduling/UnfusePVMatmuls.h"
 #include "ascend/include/CVSplitScheduling/classifyAllOps.h"
 
@@ -31,7 +32,10 @@
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/MapVector.h"
+#include "llvm/ADT/SmallString.h"
 #include "llvm/Support/Debug.h"
+#include "llvm/Support/FileSystem.h"
+#include "llvm/Support/Path.h"
 #include "llvm/Support/raw_ostream.h"
 #include <queue>
 #include <algorithm>
@@ -89,6 +93,50 @@ using namespace mlir::triton;
 namespace {
 
 using cv_split::EngineType;
+using cv_split::kUnrollOriginIdAttrName;
+
+// FIXME: remove before PR.
+static void dumpOriginTagIR(ModuleOp module, StringRef fileName) {
+  llvm::SmallString<256> dumpDir(__FILE__);
+  llvm::sys::path::remove_filename(dumpDir);
+  llvm::sys::path::append(dumpDir, "tmp_dbg");
+
+  if (std::error_code ec = llvm::sys::fs::create_directories(dumpDir)) {
+    llvm::errs() << "[cv-split] Failed to create debug dump directory "
+                 << dumpDir << ": " << ec.message() << "\n";
+    return;
+  }
+
+  llvm::SmallString<256> outputPath(dumpDir);
+  llvm::sys::path::append(outputPath, fileName);
+
+  std::error_code ec;
+  llvm::raw_fd_ostream output(outputPath, ec);
+  if (ec) {
+    llvm::errs() << "[cv-split] Failed to open debug dump " << outputPath
+                 << ": " << ec.message() << "\n";
+    return;
+  }
+
+  module.print(output);
+  output << '\n';
+}
+
+static void tagUnrollOriginIds(scf::ForOp loop) {
+  Builder builder(loop.getContext());
+  int64_t originId = 0;
+  for (Operation &op : *loop.getBody()) {
+    if (isa<scf::YieldOp>(op))
+      continue;
+    op.setAttr(kUnrollOriginIdAttrName,
+               builder.getI64IntegerAttr(originId++));
+  }
+}
+
+static void removeUnrollOriginIdAttrs(Operation *root) {
+  root->walk(
+      [](Operation *op) { op->removeAttr(kUnrollOriginIdAttrName); });
+}
 
 static StringRef engineTypeToStr(EngineType e) {
   switch (e) {
@@ -849,6 +897,11 @@ static void createScopeSeparation(
   vecScope->setAttr(hivm::TCoreTypeAttr::name,
       hivm::TCoreTypeAttr::get(ctx, hivm::TCoreType::VECTOR));
 
+  // FIXME: Rerun the DCVP classifier after Stage 8 and before scope separation,
+  // then read its cloned classification attributes in each scope. This local
+  // BFS duplicates DCVP classification rules solely because the Stage-3
+  // pointer map predates the transfer ops and becomes stale when the loop is
+  // cloned.
   // Step 4: Classify ops in each scope using BFS (includes transfer ops inserted in Stage 8)
   // This replaces the stale Stage-3 classification that pre-dates transfer insertion.
   DenseMap<Operation *, EngineType> cubeBodyClassification;
@@ -2572,6 +2625,9 @@ public:
       processFunction(funcOp);
     });
 
+    // Safety cleanup for functions that returned before the normal Stage 8
+    // cleanup point.
+    removeUnrollOriginIdAttrs(moduleOp);
     cv_split::removeDCVPClassificationAttrs(moduleOp);
 
     llvm::errs() << "\n[cv-split] ============================\n"
@@ -2588,28 +2644,34 @@ private:
   void processFunction(func::FuncOp funcOp) {
     llvm::errs() << "[cv-split] Function: " << funcOp.getName() << "\n";
 
-    int K = unrollFactor;
+    // Stage 1: pre-check conditions, and return innermost for loop
     FailureOr<scf::ForOp> preCheckResult =
-        preCheckCVSplitScheduling(funcOp, K);
+        preCheckCVSplitScheduling(funcOp, unrollFactor);
     if (failed(preCheckResult)) {
       llvm::errs() << "[cv-split] Pre-check rejected function, skip\n";
       return;
     }
+
+    // this is the unroll candidate
     scf::ForOp loop = *preCheckResult;
     llvm::errs() << "[cv-split] Pre-check accepted candidate loop\n";
 
-    // Stage 2: Unroll
-    LogicalResult unrollResult = loopUnrollByFactor(loop, K);
+    ModuleOp module = funcOp->getParentOfType<ModuleOp>();
+    dumpOriginTagIR(module, "before_tag.mlir");
+    tagUnrollOriginIds(loop);
+    dumpOriginTagIR(module, "after_tag.mlir");
+
+    // Stage 2: Unroll the innermost loop
+    LogicalResult unrollResult = loopUnrollByFactor(loop, unrollFactor);
     if (failed(unrollResult)) {
       llvm::errs() << "[cv-split] Unroll failed, bail\n";
       return;
     }
-    llvm::errs() << "[cv-split] Unrolled by " << K << "\n";
+    llvm::errs() << "[cv-split] Unrolled by " << unrollFactor << "\n";
 
     Block *body = loop.getBody();
 
     // Stage 3: Classification
-    ModuleOp module = funcOp->getParentOfType<ModuleOp>();
     FailureOr<cv_split::Classification> classificationResult =
         cv_split::classifyAllOpsWithDCVP(module, body);
     if (failed(classificationResult)) {
@@ -2640,7 +2702,13 @@ private:
 
     // Stage 8: Insert cross-scope transfers (BEFORE scope separation)
     llvm::errs() << "[cv-split] === Stage 8: cross-scope transfers ===\n";
-    cv_split::insertCrossScopeTransfers(loop, body, classification);
+    if (failed(cv_split::insertCrossScopeTransfers(loop, classification))) {
+      signalPassFailure();
+      return;
+    }
+    // Origin IDs are temporary unroll-lineage metadata. Transfer grouping is
+    // their final consumer, so do not expose them to scope/backend passes.
+    removeUnrollOriginIdAttrs(funcOp);
     llvm::errs() << "[cv-split] Stage 8 complete\n";
 
     // Dump IR after transfers, before scope separation

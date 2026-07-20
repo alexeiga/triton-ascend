@@ -1,4 +1,5 @@
 #include "ascend/include/CVSplitScheduling/CrossScopeTransfers.h"
+#include "ascend/include/CVSplitScheduling/UnrollOrigin.h"
 
 #include "bishengir/Dialect/Annotation/IR/Annotation.h"
 #include "bishengir/Dialect/HIVM/IR/HIVM.h"
@@ -9,14 +10,18 @@
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/Builders.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
-#include "llvm/ADT/StringMap.h"
 #include "llvm/Support/raw_ostream.h"
 
 #include <algorithm>
+#include <cassert>
 
 namespace mlir::triton::cv_split {
 namespace {
+
+static constexpr unsigned kMaxTransferFlagId = 14;
+static constexpr unsigned kMaxTransferFlags = kMaxTransferFlagId + 1;
 
 // ============================================================================
 // Stage 8: Insert cross-scope transfers and synchronization
@@ -35,6 +40,13 @@ struct CrossScopeTransfer {
   enum Direction { CUBE_TO_VECTOR, VECTOR_TO_CUBE } direction;
 };
 
+static int64_t getUnrollOriginId(const CrossScopeTransfer &xfer) {
+  auto originAttr = xfer.producer->getAttrOfType<IntegerAttr>(
+      kUnrollOriginIdAttrName);
+  assert(originAttr && "transfer producer must have an unroll origin ID");
+  return originAttr.getInt();
+}
+
 static SmallVector<CrossScopeTransfer> findCrossScopeValues(
     Block *body,
     const DenseMap<Operation *, EngineType> &classification) {
@@ -44,13 +56,13 @@ static SmallVector<CrossScopeTransfer> findCrossScopeValues(
     if (isa<scf::YieldOp>(&op))
       continue;
     auto prodIt = classification.find(&op);
-    if (prodIt == classification.end())
-      continue;
+    assert(prodIt != classification.end() &&
+           "body operation must have a classification");
     EngineType prodType = prodIt->second;
 
     // C→V: Only transfer results of linalg.matmul (QK and PV dot products)
-    // V→C: Only transfer values that DIRECTLY feed into linalg.matmul as operands
-    //       (these are the P values after softmax+cast)
+    // V→C: Only transfer values that DIRECTLY feed into linalg.matmul as operands,
+    //      these are the P values after softmax+cast
     //
     // Reference pattern for K=4:
     //   4× QK matmul results (C→V, fixpipe, flags 0-3)
@@ -60,14 +72,15 @@ static SmallVector<CrossScopeTransfer> findCrossScopeValues(
     if (prodType == EngineType::CUBE && isa<linalg::MatmulOp>(&op)) {
       // C→V: matmul result consumed by VECTOR ops
       for (Value result : op.getResults()) {
-        if (!isa<RankedTensorType>(result.getType()))
-          continue;
+        assert(isa<RankedTensorType>(result.getType()) &&
+               "tensor-semantics matmul must produce a ranked tensor");
         SmallVector<Operation *> crossUsers;
         for (Operation *user : result.getUsers()) {
-          if (user->getBlock() != body) continue;
-          if (isa<scf::YieldOp>(user)) continue;
+          if (user->getBlock() != body || isa<scf::YieldOp>(user))
+            continue;
           auto consIt = classification.find(user);
-          if (consIt == classification.end()) continue;
+          assert(consIt != classification.end() &&
+                 "body operation must have a classification");
           if (consIt->second == EngineType::VECTOR)
             crossUsers.push_back(user);
         }
@@ -76,25 +89,21 @@ static SmallVector<CrossScopeTransfer> findCrossScopeValues(
                                CrossScopeTransfer::CUBE_TO_VECTOR});
       }
     } else if (prodType == EngineType::VECTOR) {
-      // V→C: only if a VECTOR result feeds linalg.matmul as LHS (operand 0) or RHS (operand 1)
-      // NOT operand 2 (the output/accumulator init)
+      // V→C: transfer VECTOR results that feed matmul input operands.
+      // A VECTOR-produced DPS init should have been removed by unfusePVMatmuls.
       for (Value result : op.getResults()) {
         if (!isa<RankedTensorType>(result.getType()))
           continue;
         SmallVector<Operation *> crossUsers;
         for (Operation *user : result.getUsers()) {
-          if (user->getBlock() != body) continue;
-          if (!isa<linalg::MatmulOp>(user)) continue;
-          auto consIt = classification.find(user);
-          if (consIt == classification.end()) continue;
-          if (consIt->second != EngineType::CUBE) continue;
-          // Check it's operand 0 or 1 (LHS/RHS), not 2 (init/accumulator)
-          for (unsigned i = 0; i < 2; ++i) {
-            if (user->getOperand(i) == result) {
-              crossUsers.push_back(user);
-              break;
-            }
-          }
+          if (user->getBlock() != body || !isa<linalg::MatmulOp>(user))
+            continue;
+          bool feedsMatmulInput = user->getOperand(0) == result ||
+                                  user->getOperand(1) == result;
+          assert(feedsMatmulInput &&
+                 "VECTOR-produced matmul accumulator should have been "
+                 "unfused");
+          crossUsers.push_back(user);
         }
         if (!crossUsers.empty())
           transfers.push_back({result, &op, crossUsers,
@@ -143,14 +152,10 @@ static memref::AllocOp createAnnotatedAlloc(OpBuilder &builder, Location loc,
 // (WAR), which BiShengIR's GraphSyncSolver covers via the existing
 // sync_block_set/wait flags — exactly the depth-2 software pipeline the manual
 // kernel uses.
-struct PingPongPool {
-  llvm::StringMap<SmallVector<memref::AllocOp, 2>> slots;
-  llvm::StringMap<unsigned> useCount;
-  // One hoisted ND view (memory_space_cast of convert_layout) per L1 P buffer,
-  // matching the manual kernel which emits a single convert_layout per p_l1
-  // buffer before the KV loop and reuses it (fresh to_tensor per matmul).
-  // Multiple convert_layout views of the same cbuf buffer confuse BiShengIR's
-  // L1 NZ tracking and yield a misaligned / zero-burst matmul operand load.
+struct BufferPool {
+  DenseMap<int64_t, DenseMap<Type, SmallVector<memref::AllocOp, 2>>> slots;
+  DenseMap<int64_t, DenseMap<Type, unsigned>> useCount;
+  // Cached 2D ND view for each physical L1 buffer.
   llvm::DenseMap<Operation *, Value> ndView;
   unsigned depth = 2;
 
@@ -159,13 +164,9 @@ struct PingPongPool {
   // round-robin reuse. `builder`'s insertion point must already be set (before
   // the loop) for the create case.
   memref::AllocOp getOrCreate(OpBuilder &builder, Location loc,
-                              MemRefType allocType) {
-    std::string sig;
-    llvm::raw_string_ostream os(sig);
-    os << allocType;
-    (void)os.str();
-    auto &vec = slots[sig];
-    unsigned slot = useCount[sig]++ % depth;
+                              int64_t originId, MemRefType allocType) {
+    auto &vec = slots[originId][allocType];
+    unsigned slot = useCount[originId][allocType]++ % depth;
     if (slot < vec.size())
       return vec[slot];
     auto allocOp = createAnnotatedAlloc(builder, loc, allocType);
@@ -174,15 +175,55 @@ struct PingPongPool {
   }
 };
 
+// Return one 2D ND view per physical L1 buffer. The MTE UB->L1 copy performs
+// the hardware-specific blocked traversal; convert_layout does not move data
+// and only exposes the resulting L1 storage as an [M, N] memref.
+//
+// The view is cached because the same ping/pong buffer is reused by multiple
+// unrolled stages. Emitting a convert_layout for every stage creates aliasing
+// ND views that BiShengIR can mis-track into a misaligned / zero-burst L1->L0
+// load. It is inserted at the start of the loop so it dominates every reuse.
+// Keeping it inside the loop is also required by SplitMixKernel, which cannot
+// obtain out-operands for a scope-level convert_layout.
+static Value getOrCreateL1NdView(const TransferEmitContext &c,
+                                memref::AllocOp sharedL1AllocOp,
+                                RankedTensorType tensorType,
+                                BufferPool &bufferPool) {
+  Operation *l1Key = sharedL1AllocOp.getOperation();
+  if (Value ndView = bufferPool.ndView.lookup(l1Key))
+    return ndView;
+
+  OpBuilder builder(c.ctx);
+  scf::ForOp loop = c.loop;
+  builder.setInsertionPointToStart(loop.getBody());
+
+  ArrayRef<int64_t> shape = tensorType.getShape();
+  Type elemType = tensorType.getElementType();
+  auto l1AddrSpace =
+      builder.getAttr<hivm::AddressSpaceAttr>(hivm::AddressSpace::L1);
+  auto ndLayout = hivm::DataLayoutAttr::get(c.ctx, hivm::DataLayout::ND);
+  auto ndL1Type = MemRefType::get(shape, elemType, nullptr, l1AddrSpace);
+  auto convertOp = builder.create<hivm::ConvertLayoutOp>(
+      c.loc, ndL1Type, sharedL1AllocOp.getResult(), ndLayout, ndLayout,
+      DenseI64ArrayAttr::get(c.ctx, shape), ValueRange{});
+
+  auto plainMemrefType = MemRefType::get(shape, elemType);
+  auto castOp = builder.create<memref::MemorySpaceCastOp>(
+      c.loc, plainMemrefType, convertOp.getResult());
+  Value ndView = castOp.getResult();
+  bufferPool.ndView[l1Key] = ndView;
+  return ndView;
+}
+
 // CUBE -> VECTOR: the matmul (L0C) result is fixpipe'd to a shared UB buffer,
 // CUBE signals via sync_block_set, VECTOR waits and reads it back as a tensor.
-// ROW_SPLIT: the UB buffer is half height (16 rows); the fixpipe sends 16 rows
-// to each veccore's private UB so both veccores stay busy (2x throughput). The
-// VECTOR scope is re-tiled to 16 rows per veccore in a later stage.
+// ROW_SPLIT: for an M-row result, the UB buffer has M/2 rows and fixpipe sends
+// one half to each vector core's private UB. The VECTOR scope is re-tiled to
+// M/2 rows per vector core in a later stage.
 static void emitCubeToVectorTransfer(const TransferEmitContext &c,
                                      CrossScopeTransfer &xfer,
                                      RankedTensorType tensorType, int flagId,
-                                     PingPongPool &pool) {
+                                     BufferPool &bufferPool) {
   Type elemType = tensorType.getElementType();
   ArrayRef<int64_t> shape = tensorType.getShape();
 
@@ -191,32 +232,31 @@ static void emitCubeToVectorTransfer(const TransferEmitContext &c,
 
   auto ubAddrSpace = builder.getAttr<hivm::AddressSpaceAttr>(hivm::AddressSpace::UB);
   SmallVector<int64_t, 4> ubShape(shape.begin(), shape.end());
-  bool rowSplit = (ubShape[0] % 2 == 0);
-  if (rowSplit) ubShape[0] /= 2;
+  ubShape[0] /= 2; // ROW_SPLIT writes M/2-row shard to each vector core's UB.
   auto allocType = MemRefType::get(ubShape, elemType, nullptr, ubAddrSpace);
   auto halfTensorType = RankedTensorType::get(ubShape, elemType);
 
   // Ping/pong shared alloc before the loop (depth-2 reuse across unrolled
-  // stages instead of one buffer per transfer).
+  // clones of this original transfer operation).
   builder.setInsertionPoint(c.loop);
-  auto sharedAllocOp = pool.getOrCreate(builder, c.loc, allocType);
+  auto sharedAllocOp = bufferPool.getOrCreate(
+      builder, c.loc, getUnrollOriginId(xfer), allocType);
 
   // fixpipe after the producer (inside loop body) -> writes the shared buffer.
   builder.setInsertionPointAfter(xfer.producer);
   auto dmaModeAttr = hivm::FixpipeDMAModeAttr::get(c.ctx, hivm::FixpipeDMAMode::NZ2ND);
-  auto dualDstAttr = hivm::FixpipeDualDstModeAttr::get(c.ctx,
-      rowSplit ? hivm::FixpipeDualDstMode::ROW_SPLIT
-               : hivm::FixpipeDualDstMode::NO_DUAL);
+  auto dualDstAttr = hivm::FixpipeDualDstModeAttr::get(
+      c.ctx, hivm::FixpipeDualDstMode::ROW_SPLIT);
   builder.create<hivm::FixpipeOp>(c.loc, mlir::TypeRange{},
-      xfer.value,                    // src (full 32-row tile from dot)
-      sharedAllocOp.getResult(),     // dst (16-row shared UB alloc)
+      xfer.value,                    // src (full M-row tile from matmul)
+      sharedAllocOp.getResult(),     // dst (M/2-row shared UB alloc)
       mlir::ValueRange{}, dmaModeAttr,
       dualDstAttr, nullptr, nullptr, nullptr, mlir::ArrayAttr{}, nullptr);
 
   // CUBE signals VECTOR.
   builder.create<hivm::SyncBlockSetOp>(c.loc, c.cubeCoreAttr, c.pipeFixAttr, c.pipeVAttr, flagAttr);
 
-  // Consumer side: wait + read the shared buffer back as a 16-row tensor.
+  // Consumer side: wait + read the shared buffer back as an M/2-row tensor.
   Operation *firstConsumer = xfer.consumers.front();
   for (auto *cons : xfer.consumers)
     if (cons->isBeforeInBlock(firstConsumer))
@@ -236,7 +276,7 @@ static void emitCubeToVectorTransfer(const TransferEmitContext &c,
   llvm::errs() << "[cv-split]   C→V transfer #" << flagId
                << ": " << xfer.producer->getName()
                << " → " << ubShape[0] << "x" << ubShape[1]
-               << " UB buffer (" << (rowSplit ? "ROW_SPLIT" : "NO_DUAL") << ")\n";
+               << " UB buffer (ROW_SPLIT)\n";
 }
 
 // VECTOR -> CUBE: a softmax/cast result is NZ-packed and copied UB->L1 into a
@@ -246,8 +286,9 @@ static void emitCubeToVectorTransfer(const TransferEmitContext &c,
 // buffer keeps the flat [M, N] layout.
 static void emitVectorToCubeTransfer(const TransferEmitContext &c,
                                      CrossScopeTransfer &xfer,
-                                     RankedTensorType tensorType, int flagId,
-                                     int markAllocIndex, PingPongPool &pool) {
+                                     RankedTensorType tensorType,
+                                     int flagId,
+                                     BufferPool &bufferPool) {
   Type elemType = tensorType.getElementType();
   ArrayRef<int64_t> shape = tensorType.getShape();
 
@@ -268,9 +309,10 @@ static void emitVectorToCubeTransfer(const TransferEmitContext &c,
   auto l1AllocType = MemRefType::get(l1Shape, elemType, nullptr, l1AddrSpace);
 
   // Ping/pong shared L1 alloc before the loop (depth-2 reuse across unrolled
-  // stages instead of one buffer per transfer).
+  // clones of this original transfer operation).
   builder.setInsertionPoint(c.loop);
-  auto sharedL1AllocOp = pool.getOrCreate(builder, c.loc, l1AllocType);
+  auto sharedL1AllocOp = bufferPool.getOrCreate(
+      builder, c.loc, getUnrollOriginId(xfer), l1AllocType);
 
   // Inside loop body after producer: (NZ pack) -> to_memref -> cast -> copy.
   builder.setInsertionPointAfter(xfer.producer);
@@ -317,7 +359,8 @@ static void emitVectorToCubeTransfer(const TransferEmitContext &c,
   // VECTOR signals CUBE.
   builder.create<hivm::SyncBlockSetOp>(c.loc, c.vecCoreAttr, c.pipeMte3Attr, c.pipeMte1Attr, flagAttr);
 
-  // Consumer (CUBE) side: wait + convert_layout (NZ -> ND view) for matmul.
+  // Consumer (CUBE) side: wait, then expose the MTE-populated L1 buffer as a
+  // 2D ND view for matmul.
   Operation *firstConsumer = xfer.consumers.front();
   for (auto *cons : xfer.consumers)
     if (cons->isBeforeInBlock(firstConsumer))
@@ -326,36 +369,9 @@ static void emitVectorToCubeTransfer(const TransferEmitContext &c,
 
   builder.create<hivm::SyncBlockWaitOp>(c.loc, c.cubeCoreAttr, c.pipeMte3Attr, c.pipeMte1Attr, flagAttr);
 
-  // ONE convert_layout (NZ -> ND view) + memory_space_cast per shared L1
-  // buffer, reused across the unrolled stages that share that buffer. The
-  // manual kernel emits the convert_layout once per p_l1 buffer and only
-  // re-reads it with a fresh to_tensor per matmul. Emitting a convert_layout
-  // per unrolled stage produces several aliasing ND views of the same cbuf
-  // buffer, which BiShengIR mis-tracks into a misaligned / zero-burst L1->L0
-  // load. The view ops stay INSIDE the loop body (before the first consumer of
-  // the first stage that uses this buffer) — hoisting them above the loop
-  // breaks the MIX-kernel AIC/AIV split (SplitMixKernel can't get out-operands
-  // for a scope-level convert_layout).
-  Operation *l1Key = sharedL1AllocOp.getOperation();
-  Value ndViewVal = pool.ndView.lookup(l1Key);
-  if (!ndViewVal) {
-    // Place at the FRONT of the loop body so the single view dominates every
-    // consumer regardless of the order transfers are processed in (the reuse
-    // for later stages must be dominated by this definition).
-    OpBuilder viewBuilder(c.ctx);
-    scf::ForOp loopMut = c.loop;
-    viewBuilder.setInsertionPointToStart(loopMut.getBody());
-    auto ndLayout = hivm::DataLayoutAttr::get(c.ctx, hivm::DataLayout::ND);
-    auto ndL1Type = MemRefType::get(shape, elemType, nullptr, l1AddrSpace);
-    auto convertOp = viewBuilder.create<hivm::ConvertLayoutOp>(
-        c.loc, ndL1Type, sharedL1AllocOp.getResult(), ndLayout, ndLayout,
-        DenseI64ArrayAttr::get(c.ctx, shape), ValueRange{});
-    auto plainMemrefType = MemRefType::get(shape, elemType);
-    auto castOp = viewBuilder.create<memref::MemorySpaceCastOp>(
-        c.loc, plainMemrefType, convertOp.getResult());
-    ndViewVal = castOp.getResult();
-    pool.ndView[l1Key] = ndViewVal;
-  }
+  Value ndViewVal =
+      getOrCreateL1NdView(c, sharedL1AllocOp, tensorType, bufferPool);
+
   // Fresh to_tensor per consumer group (after the wait), like the manual.
   auto toTensorOp = builder.create<bufferization::ToTensorOp>(
       c.loc, tensorType, ndViewVal, true, true);
@@ -364,26 +380,36 @@ static void emitVectorToCubeTransfer(const TransferEmitContext &c,
     consumer->replaceUsesOfWith(xfer.value, toTensorOp.getResult());
 
   llvm::errs() << "[cv-split]   V→C transfer #" << flagId
-               << " (tightly_coupled=" << markAllocIndex << ")"
                << ": " << xfer.producer->getName()
                << " → " << M << "x" << N << " L1 buffer\n";
 }
 
 } // namespace
 
-void insertCrossScopeTransfers(
+LogicalResult insertCrossScopeTransfers(
     scf::ForOp loop,
-    Block *body,
     const DenseMap<Operation *, EngineType> &classification) {
 
   MLIRContext *ctx = loop.getContext();
   Location loc = loop.getLoc();
+  Block *body = loop.getBody();
 
   auto transfers = findCrossScopeValues(body, classification);
   if (transfers.empty()) {
     llvm::errs() << "[cv-split] No cross-scope transfers needed\n";
-    return;
+    return success();
   }
+
+  if (transfers.size() > kMaxTransferFlags) {
+    loop.emitError() << "CVSplitScheduling requires " << transfers.size()
+                     << " synchronization flags, but only "
+                     << kMaxTransferFlags << " are available (IDs 0.."
+                     << kMaxTransferFlagId << ")";
+    return failure();
+  }
+
+  llvm::errs() << "[cv-split] Found " << transfers.size()
+               << " cross-scope value transfers\n";
 
   // Sort transfers for clean flag numbering: C→V QK first, then V→C P, then C→V PV
   // QK = C→V with smaller shape; PV = C→V with larger shape; P = V→C
@@ -397,17 +423,17 @@ void insertCrossScopeTransfers(
           if (aType && bType) {
             int64_t aSize = aType.getNumElements();
             int64_t bSize = bType.getNumElements();
-            if (aSize != bSize) return aSize < bSize;
+            if (aSize != bSize)
+              return aSize < bSize;
           }
         }
         return false;
       });
 
-  llvm::errs() << "[cv-split] Found " << transfers.size()
-               << " cross-scope value transfers\n";
-
-  TransferEmitContext ec{
-      ctx, loc, loop,
+  const TransferEmitContext ec {
+      ctx,
+      loc,
+      loop,
       hivm::TCoreTypeAttr::get(ctx, hivm::TCoreType::CUBE),
       hivm::TCoreTypeAttr::get(ctx, hivm::TCoreType::VECTOR),
       hivm::PipeAttr::get(ctx, hivm::PIPE::PIPE_FIX),
@@ -415,48 +441,44 @@ void insertCrossScopeTransfers(
       hivm::PipeAttr::get(ctx, hivm::PIPE::PIPE_MTE3),
       hivm::PipeAttr::get(ctx, hivm::PIPE::PIPE_MTE1)};
 
-  // Per-channel flag counters. C->V (PIPE_FIX/PIPE_V) and V->C (PIPE_MTE3/
-  // PIPE_MTE1) are independent hardware sync channels (the HW key is the
-  // (set_pipe, wait_pipe, event_id) triple), so each gets its own 0.. range.
-  // The backend WAIT.INTRA.BLOCK intrinsic encodes the flag as a 4-bit
-  // immediate (valid 0..15); a single shared counter overflowed it at unroll-8
-  // (flags 0-23, "Cannot select" for >=16). Splitting per channel keeps
-  // unroll-8 in range (C->V 0-15, V->C 0-7) without reusing a flag inside a
-  // channel (never a set before its wait -> no set_flag hazard).
-  int cvFlagCounter = 0;  // CUBE -> VECTOR (PIPE_FIX / PIPE_V)
-  int vcFlagCounter = 0;  // VECTOR -> CUBE (PIPE_MTE3 / PIPE_MTE1)
-  int markAllocIndex = 0; // ordinal of the shared buffer across all transfers
+  // FIXME: replace the per-direction counters below with one shared flag
+  // counter. The hardware exposes 16 shared scalar-buffer IDs; pipe direction
+  // does not create a separate ID namespace. Match DCVP by allocating IDs
+  // 0..14, reserving ID 15 for control-flow synchronization, and reject the
+  // transformation before mutation when more than 15 transfers are required.
+  // With unique IDs, the currently supported unroll factor 4 needs 12 IDs.
+  //
+  // FIXME: add counter reuse. Build dependency-ordered transfer phases and
+  // reuse one ID as a counter within a phase only when the source-core set
+  // order and destination-core wait order contain the same transfers in the
+  // same order. Reject the transformation if the resulting allocation still
+  // requires more than 15 IDs.
+  int nextSyncFlagId = 0;
 
   // Depth-2 ping/pong pool shared by all transfers: same-typed buffers (all
   // unrolled qk_ub, all pv_ub, all P L1) rotate over 2 physical allocations.
-  PingPongPool pool;
+  BufferPool bufferPool;
 
   for (auto &xfer : transfers) {
-    auto tensorType = dyn_cast<RankedTensorType>(xfer.value.getType());
-    if (!tensorType) {
-      llvm::errs() << "[cv-split]   Skipping non-tensor transfer: "
-                   << xfer.value.getType() << "\n";
-      continue;
-    }
-    if (tensorType.getRank() < 2) {
-      llvm::errs() << "[cv-split]   Skipping rank-" << tensorType.getRank()
-                   << " tensor\n";
-      continue;
-    }
+    auto tensorType = cast<RankedTensorType>(xfer.value.getType());
+    // Transfer lowering handles rank-2 matmul tiles. In particular, V->C
+    // assumes an ND [M, N] tensor when constructing its NZ
+    // [N/16, M/16, 16, 16] L1 layout.
+    assert(tensorType.getRank() == 2 &&
+           "cross-scope transfers require rank-2 tensors");
 
-    if (xfer.direction == CrossScopeTransfer::CUBE_TO_VECTOR) {
-      emitCubeToVectorTransfer(ec, xfer, tensorType, cvFlagCounter++, pool);
-    } else {
-      emitVectorToCubeTransfer(ec, xfer, tensorType, vcFlagCounter++,
-                               markAllocIndex, pool);
-    }
-    ++markAllocIndex;
+    if (xfer.direction == CrossScopeTransfer::CUBE_TO_VECTOR)
+      emitCubeToVectorTransfer(ec, xfer, tensorType, nextSyncFlagId,
+                               bufferPool);
+    else
+      emitVectorToCubeTransfer(ec, xfer, tensorType, nextSyncFlagId,
+                               bufferPool);
+    ++nextSyncFlagId;
   }
 
   llvm::errs() << "[cv-split] Inserted " << transfers.size()
-               << " transfers with " << cvFlagCounter << " C->V + "
-               << vcFlagCounter << " V->C sync flags, "
-               << markAllocIndex << " tightly-coupled pairs\n";
+               << " transfers with " << nextSyncFlagId << " sync flags\n";
+  return success();
 }
 
 } // namespace mlir::triton::cv_split

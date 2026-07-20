@@ -3,8 +3,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$SCRIPT_DIR/../../../../.." && pwd)"
-OPT="${TRITON_OPT:-$REPO/python/build/cmake.linux-x86_64-cpython-3.12/bin/triton-opt}"
-FC="${FILECHECK:-${LLVM_SYSPATH:-/usr}/bin/FileCheck}"
+OPT="${TRITON_OPT:-$REPO/build-vscode-debug/bin/triton-opt}"
+FC="${FILECHECK:-${LLVM_SYSPATH:-/opt/llvm-b5cc222}/bin/FileCheck}"
 if [[ ! -x "$FC" ]]; then
   FC="$(command -v FileCheck || true)"
 fi

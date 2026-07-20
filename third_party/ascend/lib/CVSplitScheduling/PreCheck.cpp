@@ -106,6 +106,32 @@ static LogicalResult checkMatmulOutsAreRankedTensors(scf::ForOp forOp) {
   return success();
 }
 
+static LogicalResult checkMatmulDimensionsAre16Aligned(scf::ForOp forOp) {
+  auto is16AlignedRank2Tensor = [](Type type) {
+    auto tensorType = dyn_cast<RankedTensorType>(type);
+    if (!tensorType || tensorType.getRank() != 2)
+      return false;
+    for (int64_t dim : tensorType.getShape())
+      if (dim <= 0 || dim % 16 != 0)
+        return false;
+    return true;
+  };
+
+  for (Operation &op : *forOp.getBody()) {
+    auto matmulOp = dyn_cast<linalg::MatmulOp>(op);
+    if (!matmulOp)
+      continue;
+
+    for (Value operand : matmulOp->getOperands())
+      if (!is16AlignedRank2Tensor(operand.getType()))
+        return failure();
+    for (Value result : matmulOp->getResults())
+      if (!is16AlignedRank2Tensor(result.getType()))
+        return failure();
+  }
+  return success();
+}
+
 static LogicalResult checkStaticDivisibleTripCount(scf::ForOp forOp,
                                                    int unrollFactor) {
   std::optional<int64_t> lowerBound =
@@ -160,6 +186,13 @@ mlir::triton::preCheckCVSplitScheduling(func::FuncOp funcOp,
     LLVM_DEBUG(llvm::dbgs()
                << "[cv-split-pre-check] linalg.matmul outs must be a ranked "
                   "tensor\n");
+    return failure();
+  }
+
+  if (failed(checkMatmulDimensionsAre16Aligned(candidate))) {
+    LLVM_DEBUG(llvm::dbgs()
+               << "[cv-split-pre-check] linalg.matmul operands and results "
+                  "must be rank-2 tensors with dimensions divisible by 16\n");
     return failure();
   }
 

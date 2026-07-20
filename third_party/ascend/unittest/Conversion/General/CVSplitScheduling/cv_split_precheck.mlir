@@ -252,6 +252,27 @@ func.func @branching_inside_candidate(%condition: i1) {
   return
 }
 
+// REJECT-LABEL: func.func @while_inside_candidate
+// REJECT: scf.while
+// DIAG: [cv-split] Function: while_inside_candidate
+// DIAG-NEXT: [cv-split] Pre-check rejected function, skip
+func.func @while_inside_candidate() {
+  %c0 = arith.constant 0 : index
+  %c1 = arith.constant 1 : index
+  %c16 = arith.constant 16 : index
+  scf.for %iv = %c0 to %c16 step %c1 {
+    %result = scf.while (%arg = %c0) : (index) -> index {
+      %condition = arith.cmpi slt, %arg, %c1 : index
+      scf.condition(%condition) %arg : index
+    } do {
+    ^bb0(%arg : index):
+      %next = arith.addi %arg, %c1 : index
+      scf.yield %next : index
+    }
+  }
+  return
+}
+
 // REJECT-LABEL: func.func @insert_slice_inside_candidate
 // REJECT: tensor.insert_slice
 // DIAG: [cv-split] Function: insert_slice_inside_candidate
@@ -311,13 +332,33 @@ func.func @ranked_tensor_matmul_out() {
   %c0 = arith.constant 0 : index
   %c1 = arith.constant 1 : index
   %c16 = arith.constant 16 : index
-  %lhs = tensor.empty() : tensor<4x4xf32>
-  %rhs = tensor.empty() : tensor<4x4xf32>
-  %out = tensor.empty() : tensor<4x4xf32>
+  %lhs = tensor.empty() : tensor<16x16xf32>
+  %rhs = tensor.empty() : tensor<16x16xf32>
+  %out = tensor.empty() : tensor<16x16xf32>
   scf.for %iv = %c0 to %c16 step %c1 {
     %result = linalg.matmul
-        ins(%lhs, %rhs : tensor<4x4xf32>, tensor<4x4xf32>)
-        outs(%out : tensor<4x4xf32>) -> tensor<4x4xf32>
+        ins(%lhs, %rhs : tensor<16x16xf32>, tensor<16x16xf32>)
+        outs(%out : tensor<16x16xf32>) -> tensor<16x16xf32>
+  }
+  return
+}
+
+// Matmul tile dimensions must be multiples of the hardware NZ block size.
+// REJECT-LABEL: func.func @unaligned_tensor_matmul
+// REJECT: linalg.matmul
+// DIAG: [cv-split] Function: unaligned_tensor_matmul
+// DIAG-NEXT: [cv-split] Pre-check rejected function, skip
+func.func @unaligned_tensor_matmul() {
+  %c0 = arith.constant 0 : index
+  %c1 = arith.constant 1 : index
+  %c16 = arith.constant 16 : index
+  %lhs = tensor.empty() : tensor<16x8xf32>
+  %rhs = tensor.empty() : tensor<8x16xf32>
+  %out = tensor.empty() : tensor<16x16xf32>
+  scf.for %iv = %c0 to %c16 step %c1 {
+    %result = linalg.matmul
+        ins(%lhs, %rhs : tensor<16x8xf32>, tensor<8x16xf32>)
+        outs(%out : tensor<16x16xf32>) -> tensor<16x16xf32>
   }
   return
 }

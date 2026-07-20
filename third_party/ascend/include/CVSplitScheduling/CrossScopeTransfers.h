@@ -3,11 +3,12 @@
 
 #include "ascend/include/CVSplitScheduling/classifyAllOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Support/LogicalResult.h"
 
 namespace mlir::triton::cv_split {
 
-void insertCrossScopeTransfers(scf::ForOp loop, Block *body,
-                               const Classification &classification);
+LogicalResult insertCrossScopeTransfers(
+    scf::ForOp loop, const Classification &classification);
 
 } // namespace mlir::triton::cv_split
 
