@@ -12,17 +12,17 @@
 // CHECK-NEXT: annotation.mark %{{.*}} {effects = ["write", "read"]} : memref<16x32xf32, #hivm.address_space<ub>>
 // CHECK-NEXT: %{{.*}} = memref.alloc() : memref<16x32xf32, #hivm.address_space<ub>>
 // CHECK-NEXT: annotation.mark %{{.*}} {effects = ["write", "read"]} : memref<16x32xf32, #hivm.address_space<ub>>
-// CHECK-NEXT: %{{.*}} = memref.alloc() : memref<16x64xf32, #hivm.address_space<ub>>
-// CHECK-NEXT: annotation.mark %{{.*}} {effects = ["write", "read"]} : memref<16x64xf32, #hivm.address_space<ub>>
-// CHECK-NEXT: %{{.*}} = memref.alloc() : memref<16x64xf32, #hivm.address_space<ub>>
-// CHECK-NEXT: annotation.mark %{{.*}} {effects = ["write", "read"]} : memref<16x64xf32, #hivm.address_space<ub>>
 // CHECK-NEXT: %{{.*}} = memref.alloc() : memref<32x64xf16, #hivm.address_space<cbuf>>
 // CHECK-NEXT: annotation.mark %{{.*}} {mem_unique} : memref<32x64xf16, #hivm.address_space<cbuf>>
 // CHECK-NEXT: annotation.mark %{{.*}} {effects = ["write", "read"]} : memref<32x64xf16, #hivm.address_space<cbuf>>
 // CHECK-NEXT: %{{.*}} = memref.alloc() : memref<2x2x16x16xf16, #hivm.address_space<cbuf>>
 // CHECK-NEXT: annotation.mark %{{.*}} {effects = ["write", "read"]} : memref<2x2x16x16xf16, #hivm.address_space<cbuf>>
+// CHECK-NEXT: %{{.*}} = memref.alloc() : memref<16x64xf32, #hivm.address_space<ub>>
+// CHECK-NEXT: annotation.mark %{{.*}} {effects = ["write", "read"]} : memref<16x64xf32, #hivm.address_space<ub>>
 // CHECK-NEXT: %{{.*}} = memref.alloc() : memref<2x2x16x16xf16, #hivm.address_space<cbuf>>
 // CHECK-NEXT: annotation.mark %{{.*}} {effects = ["write", "read"]} : memref<2x2x16x16xf16, #hivm.address_space<cbuf>>
+// CHECK-NEXT: %{{.*}} = memref.alloc() : memref<16x64xf32, #hivm.address_space<ub>>
+// CHECK-NEXT: annotation.mark %{{.*}} {effects = ["write", "read"]} : memref<16x64xf32, #hivm.address_space<ub>>
 
 // CHECK: scope.scope : () -> () {
 // CHECK-NEXT: %{{.*}} = memref.alloc() : memref<32x64xf16>
@@ -45,18 +45,18 @@
 // CHECK-NEXT: hivm.hir.sync_block_set[<CUBE>, <PIPE_FIX>, <PIPE_V>] flag = 2
 // CHECK: hivm.hir.fixpipe {{.*}} dual_dst_mode = {{<}}ROW_SPLIT{{>}}
 // CHECK-NEXT: hivm.hir.sync_block_set[<CUBE>, <PIPE_FIX>, <PIPE_V>] flag = 3
-// CHECK: hivm.hir.sync_block_wait[<CUBE>, <PIPE_MTE3>, <PIPE_MTE1>] flag = 8
-// CHECK: hivm.hir.fixpipe {{.*}} dual_dst_mode = {{<}}ROW_SPLIT{{>}}
-// CHECK-NEXT: hivm.hir.sync_block_set[<CUBE>, <PIPE_FIX>, <PIPE_V>] flag = 4
-// CHECK: hivm.hir.sync_block_wait[<CUBE>, <PIPE_MTE3>, <PIPE_MTE1>] flag = 9
+// CHECK: hivm.hir.sync_block_wait[<CUBE>, <PIPE_MTE3>, <PIPE_MTE1>] flag = 4
 // CHECK: hivm.hir.fixpipe {{.*}} dual_dst_mode = {{<}}ROW_SPLIT{{>}}
 // CHECK-NEXT: hivm.hir.sync_block_set[<CUBE>, <PIPE_FIX>, <PIPE_V>] flag = 5
-// CHECK: hivm.hir.sync_block_wait[<CUBE>, <PIPE_MTE3>, <PIPE_MTE1>] flag = 10
+// CHECK: hivm.hir.sync_block_wait[<CUBE>, <PIPE_MTE3>, <PIPE_MTE1>] flag = 6
 // CHECK: hivm.hir.fixpipe {{.*}} dual_dst_mode = {{<}}ROW_SPLIT{{>}}
-// CHECK-NEXT: hivm.hir.sync_block_set[<CUBE>, <PIPE_FIX>, <PIPE_V>] flag = 6
-// CHECK: hivm.hir.sync_block_wait[<CUBE>, <PIPE_MTE3>, <PIPE_MTE1>] flag = 11
+// CHECK-NEXT: hivm.hir.sync_block_set[<CUBE>, <PIPE_FIX>, <PIPE_V>] flag = 8
+// CHECK: hivm.hir.sync_block_wait[<CUBE>, <PIPE_MTE3>, <PIPE_MTE1>] flag = 7
 // CHECK: hivm.hir.fixpipe {{.*}} dual_dst_mode = {{<}}ROW_SPLIT{{>}}
-// CHECK-NEXT: hivm.hir.sync_block_set[<CUBE>, <PIPE_FIX>, <PIPE_V>] flag = 7
+// CHECK-NEXT: hivm.hir.sync_block_set[<CUBE>, <PIPE_FIX>, <PIPE_V>] flag = 10
+// CHECK: hivm.hir.sync_block_wait[<CUBE>, <PIPE_MTE3>, <PIPE_MTE1>] flag = 9
+// CHECK: hivm.hir.fixpipe {{.*}} dual_dst_mode = {{<}}ROW_SPLIT{{>}}
+// CHECK-NEXT: hivm.hir.sync_block_set[<CUBE>, <PIPE_FIX>, <PIPE_V>] flag = 11
 
 // CHECK: scope.return
 // CHECK-NEXT: } {hivm.tcore_type = #hivm.tcore_type<CUBE>, noinline}
@@ -83,17 +83,17 @@
 // CHECK: hivm.hir.sync_block_wait[<VECTOR>, <PIPE_FIX>, <PIPE_V>] flag = 2
 // CHECK: hivm.hir.sync_block_wait[<VECTOR>, <PIPE_FIX>, <PIPE_V>] flag = 3
 // CHECK: hivm.hir.copy ins(%{{.*}} : memref<2x1x16x16xf16, #hivm.address_space<ub>>) outs(%{{.*}} : memref<2x1x16x16xf16, strided<[512, 256, 16, 1], offset: ?>, #hivm.address_space<cbuf>>)
-// CHECK-NEXT: hivm.hir.sync_block_set[<VECTOR>, <PIPE_MTE3>, <PIPE_MTE1>] flag = 8
-// CHECK: hivm.hir.sync_block_wait[<VECTOR>, <PIPE_FIX>, <PIPE_V>] flag = 4
-// CHECK: hivm.hir.copy ins(%{{.*}} : memref<2x1x16x16xf16, #hivm.address_space<ub>>) outs(%{{.*}} : memref<2x1x16x16xf16, strided<[512, 256, 16, 1], offset: ?>, #hivm.address_space<cbuf>>)
-// CHECK-NEXT: hivm.hir.sync_block_set[<VECTOR>, <PIPE_MTE3>, <PIPE_MTE1>] flag = 9
-// CHECK: hivm.hir.copy ins(%{{.*}} : memref<2x1x16x16xf16, #hivm.address_space<ub>>) outs(%{{.*}} : memref<2x1x16x16xf16, strided<[512, 256, 16, 1], offset: ?>, #hivm.address_space<cbuf>>)
-// CHECK-NEXT: hivm.hir.sync_block_set[<VECTOR>, <PIPE_MTE3>, <PIPE_MTE1>] flag = 10
+// CHECK-NEXT: hivm.hir.sync_block_set[<VECTOR>, <PIPE_MTE3>, <PIPE_MTE1>] flag = 4
 // CHECK: hivm.hir.sync_block_wait[<VECTOR>, <PIPE_FIX>, <PIPE_V>] flag = 5
 // CHECK: hivm.hir.copy ins(%{{.*}} : memref<2x1x16x16xf16, #hivm.address_space<ub>>) outs(%{{.*}} : memref<2x1x16x16xf16, strided<[512, 256, 16, 1], offset: ?>, #hivm.address_space<cbuf>>)
-// CHECK-NEXT: hivm.hir.sync_block_set[<VECTOR>, <PIPE_MTE3>, <PIPE_MTE1>] flag = 11
-// CHECK: hivm.hir.sync_block_wait[<VECTOR>, <PIPE_FIX>, <PIPE_V>] flag = 6
-// CHECK: hivm.hir.sync_block_wait[<VECTOR>, <PIPE_FIX>, <PIPE_V>] flag = 7
+// CHECK-NEXT: hivm.hir.sync_block_set[<VECTOR>, <PIPE_MTE3>, <PIPE_MTE1>] flag = 6
+// CHECK: hivm.hir.copy ins(%{{.*}} : memref<2x1x16x16xf16, #hivm.address_space<ub>>) outs(%{{.*}} : memref<2x1x16x16xf16, strided<[512, 256, 16, 1], offset: ?>, #hivm.address_space<cbuf>>)
+// CHECK-NEXT: hivm.hir.sync_block_set[<VECTOR>, <PIPE_MTE3>, <PIPE_MTE1>] flag = 7
+// CHECK: hivm.hir.sync_block_wait[<VECTOR>, <PIPE_FIX>, <PIPE_V>] flag = 8
+// CHECK: hivm.hir.copy ins(%{{.*}} : memref<2x1x16x16xf16, #hivm.address_space<ub>>) outs(%{{.*}} : memref<2x1x16x16xf16, strided<[512, 256, 16, 1], offset: ?>, #hivm.address_space<cbuf>>)
+// CHECK-NEXT: hivm.hir.sync_block_set[<VECTOR>, <PIPE_MTE3>, <PIPE_MTE1>] flag = 9
+// CHECK: hivm.hir.sync_block_wait[<VECTOR>, <PIPE_FIX>, <PIPE_V>] flag = 10
+// CHECK: hivm.hir.sync_block_wait[<VECTOR>, <PIPE_FIX>, <PIPE_V>] flag = 11
 
 // CHECK: scope.return
 // CHECK-NEXT: } {hivm.tcore_type = #hivm.tcore_type<VECTOR>, noinline}

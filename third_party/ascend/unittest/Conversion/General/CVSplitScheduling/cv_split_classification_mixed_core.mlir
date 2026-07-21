@@ -10,16 +10,16 @@
 // IR: scope.scope
 
 module attributes {hacc.target = #hacc.target<"Ascend950PR_9589">} {
-  func.func @cube_and_vector(%lhs: tensor<16x16xf16>,
+  func.func @cube_and_vector(%lhs: tensor<32x16xf16>,
                              %rhs: tensor<16x16xf16>,
-                             %init: tensor<16x16xf32>) {
+                             %init: tensor<32x16xf32>) {
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
     %c16 = arith.constant 16 : index
     scf.for %iv = %c0 to %c16 step %c1 {
-      %matmul = linalg.matmul ins(%lhs, %rhs : tensor<16x16xf16>, tensor<16x16xf16>)
-          outs(%init : tensor<16x16xf32>) -> tensor<16x16xf32>
-      %result = math.exp %matmul : tensor<16x16xf32>
+      %matmul = linalg.matmul ins(%lhs, %rhs : tensor<32x16xf16>, tensor<16x16xf16>)
+          outs(%init : tensor<32x16xf32>) -> tensor<32x16xf32>
+      %result = math.exp %matmul : tensor<32x16xf32>
     }
     return
   }

@@ -332,6 +332,27 @@ func.func @ranked_tensor_matmul_out() {
   %c0 = arith.constant 0 : index
   %c1 = arith.constant 1 : index
   %c16 = arith.constant 16 : index
+  %lhs = tensor.empty() : tensor<32x16xf32>
+  %rhs = tensor.empty() : tensor<16x16xf32>
+  %out = tensor.empty() : tensor<32x16xf32>
+  scf.for %iv = %c0 to %c16 step %c1 {
+    %result = linalg.matmul
+        ins(%lhs, %rhs : tensor<32x16xf32>, tensor<16x16xf32>)
+        outs(%out : tensor<32x16xf32>) -> tensor<32x16xf32>
+  }
+  return
+}
+
+// ROW_SPLIT requires each of the two vector cores to receive a whole number
+// of 16-row NZ blocks, so the original matmul M dimension must divide by 32.
+// REJECT-LABEL: func.func @row_split_unaligned_matmul
+// REJECT: linalg.matmul
+// DIAG: [cv-split] Function: row_split_unaligned_matmul
+// DIAG-NEXT: [cv-split] Pre-check rejected function, skip
+func.func @row_split_unaligned_matmul() {
+  %c0 = arith.constant 0 : index
+  %c1 = arith.constant 1 : index
+  %c16 = arith.constant 16 : index
   %lhs = tensor.empty() : tensor<16x16xf32>
   %rhs = tensor.empty() : tensor<16x16xf32>
   %out = tensor.empty() : tensor<16x16xf32>

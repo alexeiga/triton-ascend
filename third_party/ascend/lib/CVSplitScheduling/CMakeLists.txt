@@ -4,6 +4,7 @@ add_triton_library(CVSplitScheduling
   classifyAllOps.cpp
   DependencyScheduler.cpp
   PreCheck.cpp
+  ScopeSeparation.cpp
   UnfusePVMatmuls.cpp
 
   DEPENDS

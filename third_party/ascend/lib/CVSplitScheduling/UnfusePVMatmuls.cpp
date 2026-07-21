@@ -71,6 +71,8 @@ void unfusePVMatmuls(Block *body, Classification &classification) {
     // Classify new ops
     classification[zeroConst] = EngineType::CUBE;
     classification[addOp] = EngineType::VECTOR;
+    setOpEngineTypeAttr(zeroConst, EngineType::CUBE);
+    setOpEngineTypeAttr(addOp, EngineType::VECTOR);
   }
 }
 

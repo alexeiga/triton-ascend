@@ -132,6 +132,23 @@ static LogicalResult checkMatmulDimensionsAre16Aligned(scf::ForOp forOp) {
   return success();
 }
 
+// ROW_SPLIT assigns M/2 rows to each vector core. The subsequent V->C NZ pack
+// groups those per-core rows in blocks of 16, so the original M must be a
+// multiple of 2 * 16 = 32.
+static LogicalResult checkMatmulRowsAre32Aligned(scf::ForOp forOp) {
+  for (Operation &op : *forOp.getBody()) {
+    auto matmulOp = dyn_cast<linalg::MatmulOp>(op);
+    if (!matmulOp)
+      continue;
+
+    auto resultType = dyn_cast<RankedTensorType>(matmulOp.getResult(0).getType());
+    if (!resultType || resultType.getRank() != 2 ||
+        resultType.getShape()[0] <= 0 || resultType.getShape()[0] % 32 != 0)
+      return failure();
+  }
+  return success();
+}
+
 static LogicalResult checkStaticDivisibleTripCount(scf::ForOp forOp,
                                                    int unrollFactor) {
   std::optional<int64_t> lowerBound =
@@ -193,6 +210,13 @@ mlir::triton::preCheckCVSplitScheduling(func::FuncOp funcOp,
     LLVM_DEBUG(llvm::dbgs()
                << "[cv-split-pre-check] linalg.matmul operands and results "
                   "must be rank-2 tensors with dimensions divisible by 16\n");
+    return failure();
+  }
+
+  if (failed(checkMatmulRowsAre32Aligned(candidate))) {
+    LLVM_DEBUG(llvm::dbgs()
+               << "[cv-split-pre-check] linalg.matmul output rows must be "
+                  "divisible by 32 for two-core ROW_SPLIT\n");
     return failure();
   }
 

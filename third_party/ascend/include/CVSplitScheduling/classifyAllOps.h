@@ -11,6 +11,10 @@ namespace mlir::triton::cv_split {
 enum class EngineType { CUBE, VECTOR };
 using Classification = llvm::DenseMap<Operation *, EngineType>;
 
+/// Stamps a newly-created operation with the same core ownership attribute
+/// emitted by DynamicCVPipeline's classifier.
+void setOpEngineTypeAttr(Operation *op, EngineType engineType);
+
 /// Runs DynamicCVPipeline's operation classifier on the module, then imports
 /// the classifications for operations directly contained in `body`.
 FailureOr<Classification> classifyAllOpsWithDCVP(ModuleOp module, Block *body);

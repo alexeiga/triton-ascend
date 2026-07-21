@@ -11,6 +11,13 @@
 
 namespace mlir::triton::cv_split {
 
+void setOpEngineTypeAttr(Operation *op, EngineType engineType) {
+  StringRef coreType =
+      engineType == EngineType::CUBE ? "CUBE" : "VECTOR";
+  op->setAttr(CVPipeline::kCoreType,
+              StringAttr::get(op->getContext(), coreType));
+}
+
 // FIXME: remove before PR.
 static void dumpClassifierIR(ModuleOp module, StringRef fileName) {
   llvm::SmallString<256> dumpDir(__FILE__);

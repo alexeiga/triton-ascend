@@ -14,7 +14,6 @@
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/raw_ostream.h"
 
-#include <algorithm>
 #include <cassert>
 
 namespace mlir::triton::cv_split {
@@ -206,10 +205,12 @@ static Value getOrCreateL1NdView(const TransferEmitContext &c,
   auto convertOp = builder.create<hivm::ConvertLayoutOp>(
       c.loc, ndL1Type, sharedL1AllocOp.getResult(), ndLayout, ndLayout,
       DenseI64ArrayAttr::get(c.ctx, shape), ValueRange{});
+  setOpEngineTypeAttr(convertOp, EngineType::CUBE);
 
   auto plainMemrefType = MemRefType::get(shape, elemType);
   auto castOp = builder.create<memref::MemorySpaceCastOp>(
       c.loc, plainMemrefType, convertOp.getResult());
+  setOpEngineTypeAttr(castOp, EngineType::CUBE);
   Value ndView = castOp.getResult();
   bufferPool.ndView[l1Key] = ndView;
   return ndView;
@@ -247,14 +248,17 @@ static void emitCubeToVectorTransfer(const TransferEmitContext &c,
   auto dmaModeAttr = hivm::FixpipeDMAModeAttr::get(c.ctx, hivm::FixpipeDMAMode::NZ2ND);
   auto dualDstAttr = hivm::FixpipeDualDstModeAttr::get(
       c.ctx, hivm::FixpipeDualDstMode::ROW_SPLIT);
-  builder.create<hivm::FixpipeOp>(c.loc, mlir::TypeRange{},
+  auto fixpipeOp = builder.create<hivm::FixpipeOp>(c.loc, mlir::TypeRange{},
       xfer.value,                    // src (full M-row tile from matmul)
       sharedAllocOp.getResult(),     // dst (M/2-row shared UB alloc)
       mlir::ValueRange{}, dmaModeAttr,
       dualDstAttr, nullptr, nullptr, nullptr, mlir::ArrayAttr{}, nullptr);
+  setOpEngineTypeAttr(fixpipeOp, EngineType::CUBE);
 
   // CUBE signals VECTOR.
-  builder.create<hivm::SyncBlockSetOp>(c.loc, c.cubeCoreAttr, c.pipeFixAttr, c.pipeVAttr, flagAttr);
+  auto syncSetOp = builder.create<hivm::SyncBlockSetOp>(
+      c.loc, c.cubeCoreAttr, c.pipeFixAttr, c.pipeVAttr, flagAttr);
+  setOpEngineTypeAttr(syncSetOp, EngineType::CUBE);
 
   // Consumer side: wait + read the shared buffer back as an M/2-row tensor.
   Operation *firstConsumer = xfer.consumers.front();
@@ -263,12 +267,16 @@ static void emitCubeToVectorTransfer(const TransferEmitContext &c,
       firstConsumer = cons;
   builder.setInsertionPoint(firstConsumer);
 
-  builder.create<hivm::SyncBlockWaitOp>(c.loc, c.vecCoreAttr, c.pipeFixAttr, c.pipeVAttr, flagAttr);
+  auto syncWaitOp = builder.create<hivm::SyncBlockWaitOp>(
+      c.loc, c.vecCoreAttr, c.pipeFixAttr, c.pipeVAttr, flagAttr);
+  setOpEngineTypeAttr(syncWaitOp, EngineType::VECTOR);
 
   auto plainMemrefType = MemRefType::get(ubShape, elemType);
   auto castOp = builder.create<memref::MemorySpaceCastOp>(c.loc, plainMemrefType, sharedAllocOp.getResult());
+  setOpEngineTypeAttr(castOp, EngineType::VECTOR);
   auto toTensorOp = builder.create<bufferization::ToTensorOp>(
       c.loc, halfTensorType, castOp.getResult(), /*restrict=*/true, /*writable=*/true);
+  setOpEngineTypeAttr(toTensorOp, EngineType::VECTOR);
 
   for (auto *consumer : xfer.consumers)
     consumer->replaceUsesOfWith(xfer.value, toTensorOp.getResult());
@@ -328,36 +336,47 @@ static void emitVectorToCubeTransfer(const TransferEmitContext &c,
     auto s3Type = RankedTensorType::get({3}, i64Ty);
     auto s3Const = builder.create<arith::ConstantOp>(c.loc, s3Type,
         DenseElementsAttr::get(s3Type, ArrayRef<int64_t>{M, N16, 16}));
+    setOpEngineTypeAttr(s3Const, EngineType::VECTOR);
     auto resh1Type = RankedTensorType::get({M, N16, 16}, elemType);
     auto resh1 = builder.create<tensor::ReshapeOp>(c.loc, resh1Type,
         xfer.value, s3Const.getResult());
+    setOpEngineTypeAttr(resh1, EngineType::VECTOR);
     auto emptyT = builder.create<tensor::EmptyOp>(c.loc,
         ArrayRef<int64_t>{N16, M, 16}, elemType);
+    setOpEngineTypeAttr(emptyT, EngineType::VECTOR);
     auto transp = builder.create<linalg::TransposeOp>(c.loc, resh1.getResult(),
         emptyT.getResult(), ArrayRef<int64_t>{1, 0, 2});
+    setOpEngineTypeAttr(transp, EngineType::VECTOR);
     auto s4Type = RankedTensorType::get({4}, i64Ty);
     auto s4Const = builder.create<arith::ConstantOp>(c.loc, s4Type,
         DenseElementsAttr::get(s4Type, ArrayRef<int64_t>{N16, M16, 16, 16}));
+    setOpEngineTypeAttr(s4Const, EngineType::VECTOR);
     auto nzTensorType = RankedTensorType::get({N16, M16, 16, 16}, elemType);
     auto resh2 = builder.create<tensor::ReshapeOp>(c.loc, nzTensorType,
         transp->getResult(0), s4Const.getResult());
+    setOpEngineTypeAttr(resh2, EngineType::VECTOR);
     packedTensor = resh2.getResult();
   }
 
   auto srcMemrefType = MemRefType::get(srcShape, elemType);
   auto toMemrefOp = builder.create<bufferization::ToMemrefOp>(
       c.loc, srcMemrefType, packedTensor);
+  setOpEngineTypeAttr(toMemrefOp, EngineType::VECTOR);
   auto ubMemrefType = MemRefType::get(srcShape, elemType, nullptr, ubAddrSpace);
   auto ubCastOp = builder.create<memref::MemorySpaceCastOp>(
       c.loc, ubMemrefType, toMemrefOp.getResult());
+  setOpEngineTypeAttr(ubCastOp, EngineType::VECTOR);
 
   // UB -> L1 copy (same NZ/flat shape on both sides).
-  builder.create<hivm::CopyOp>(c.loc, mlir::TypeRange{},
+  auto copyOp = builder.create<hivm::CopyOp>(c.loc, mlir::TypeRange{},
       ubCastOp.getResult(),           // src (UB memref)
       sharedL1AllocOp.getResult());   // dst (shared L1 memref)
+  setOpEngineTypeAttr(copyOp, EngineType::VECTOR);
 
   // VECTOR signals CUBE.
-  builder.create<hivm::SyncBlockSetOp>(c.loc, c.vecCoreAttr, c.pipeMte3Attr, c.pipeMte1Attr, flagAttr);
+  auto syncSetOp = builder.create<hivm::SyncBlockSetOp>(
+      c.loc, c.vecCoreAttr, c.pipeMte3Attr, c.pipeMte1Attr, flagAttr);
+  setOpEngineTypeAttr(syncSetOp, EngineType::VECTOR);
 
   // Consumer (CUBE) side: wait, then expose the MTE-populated L1 buffer as a
   // 2D ND view for matmul.
@@ -367,7 +386,9 @@ static void emitVectorToCubeTransfer(const TransferEmitContext &c,
       firstConsumer = cons;
   builder.setInsertionPoint(firstConsumer);
 
-  builder.create<hivm::SyncBlockWaitOp>(c.loc, c.cubeCoreAttr, c.pipeMte3Attr, c.pipeMte1Attr, flagAttr);
+  auto syncWaitOp = builder.create<hivm::SyncBlockWaitOp>(
+      c.loc, c.cubeCoreAttr, c.pipeMte3Attr, c.pipeMte1Attr, flagAttr);
+  setOpEngineTypeAttr(syncWaitOp, EngineType::CUBE);
 
   Value ndViewVal =
       getOrCreateL1NdView(c, sharedL1AllocOp, tensorType, bufferPool);
@@ -375,6 +396,7 @@ static void emitVectorToCubeTransfer(const TransferEmitContext &c,
   // Fresh to_tensor per consumer group (after the wait), like the manual.
   auto toTensorOp = builder.create<bufferization::ToTensorOp>(
       c.loc, tensorType, ndViewVal, true, true);
+  setOpEngineTypeAttr(toTensorOp, EngineType::CUBE);
 
   for (auto *consumer : xfer.consumers)
     consumer->replaceUsesOfWith(xfer.value, toTensorOp.getResult());
@@ -410,25 +432,6 @@ LogicalResult insertCrossScopeTransfers(
 
   llvm::errs() << "[cv-split] Found " << transfers.size()
                << " cross-scope value transfers\n";
-
-  // Sort transfers for clean flag numbering: C→V QK first, then V→C P, then C→V PV
-  // QK = C→V with smaller shape; PV = C→V with larger shape; P = V→C
-  std::stable_sort(transfers.begin(), transfers.end(),
-      [](const CrossScopeTransfer &a, const CrossScopeTransfer &b) {
-        if (a.direction != b.direction)
-          return a.direction == CrossScopeTransfer::CUBE_TO_VECTOR;
-        if (a.direction == CrossScopeTransfer::CUBE_TO_VECTOR) {
-          auto aType = dyn_cast<RankedTensorType>(a.value.getType());
-          auto bType = dyn_cast<RankedTensorType>(b.value.getType());
-          if (aType && bType) {
-            int64_t aSize = aType.getNumElements();
-            int64_t bSize = bType.getNumElements();
-            if (aSize != bSize)
-              return aSize < bSize;
-          }
-        }
-        return false;
-      });
 
   const TransferEmitContext ec {
       ctx,
