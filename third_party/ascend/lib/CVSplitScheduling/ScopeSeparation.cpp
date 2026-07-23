@@ -22,8 +22,11 @@
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/SetVector.h"
+#include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringMap.h"
+#include "llvm/Support/FileSystem.h"
+#include "llvm/Support/Path.h"
 #include "llvm/Support/raw_ostream.h"
 
 #include <algorithm>
@@ -36,6 +39,33 @@ using namespace mlir::triton;
 
 namespace mlir::triton::cv_split {
 namespace {
+
+// FIXME: remove before PR.
+static void dumpScopeDebugIR(scope::ScopeOp scopeOp, StringRef fileName) {
+  llvm::SmallString<256> dumpDir(__FILE__);
+  llvm::sys::path::remove_filename(dumpDir);
+  llvm::sys::path::append(dumpDir, "tmp_dbg");
+
+  if (std::error_code ec = llvm::sys::fs::create_directories(dumpDir)) {
+    llvm::errs() << "[cv-split] Failed to create debug dump directory "
+                 << dumpDir << ": " << ec.message() << "\n";
+    return;
+  }
+
+  llvm::SmallString<256> outputPath(dumpDir);
+  llvm::sys::path::append(outputPath, fileName);
+
+  std::error_code ec;
+  llvm::raw_fd_ostream output(outputPath, ec);
+  if (ec) {
+    llvm::errs() << "[cv-split] Failed to open debug dump " << outputPath
+                 << ": " << ec.message() << "\n";
+    return;
+  }
+
+  scopeOp.print(output);
+  output << '\n';
+}
 
 static StringRef engineTypeToStr(EngineType e) {
   switch (e) {
@@ -101,20 +131,15 @@ static FailureOr<EngineType> getStampedEngineType(Operation *op) {
   return failure();
 }
 
-static LogicalResult stripWrongTypeOps(scope::ScopeOp scopeOp,
-                                       EngineType keepType) {
-  llvm::errs() << "[cv-split] Stripping " 
-               << (keepType == EngineType::CUBE ? "VECTOR" : "CUBE")
-               << " ops from " << engineTypeToStr(keepType) << " scope\n";
+static FailureOr<size_t> stripWrongTypeOpsFromBlock(Block &block,
+                                                    EngineType keepType) {
+  Operation *terminator = block.getTerminator();
+  SmallVector<Operation *> toErase;
 
-  Block &scopeBlock = scopeOp.getBodyRegion().front();
+  for (Operation &op : block) {
+    if (&op == terminator || isa<scf::ForOp>(&op))
+      continue;
 
-  // First pass: strip wrong-type ops at the scope's top-level block
-  auto *terminator = scopeBlock.getTerminator();
-  SmallVector<Operation *> topLevelToErase;
-  for (Operation &op : scopeBlock) {
-    if (&op == terminator) continue;
-    if (isa<scf::ForOp>(&op)) continue;
     if (isa<arith::ConstantOp>(&op)) {
       // Constants are deliberately replicated. Stamp each copy with its
       // containing scope so the intermediate classification stays truthful.
@@ -122,141 +147,107 @@ static LogicalResult stripWrongTypeOps(scope::ScopeOp scopeOp,
       continue;
     }
 
-    // Keep scalar/index ops (address math, loop control)
-    bool allScalar = true;
-    for (Value res : op.getResults()) {
-      Type t = res.getType();
-      if (!t.isIntOrIndexOrFloat()) {
+    // Keep scalar/index ops (address math and loop control) in both scopes.
+    bool allScalar = op.getNumResults() > 0;
+    for (Value result : op.getResults()) {
+      if (!result.getType().isIntOrIndexOrFloat()) {
         allScalar = false;
         break;
       }
     }
-    if (allScalar && op.getNumResults() > 0) {
+    if (allScalar) {
       setOpEngineTypeAttr(&op, keepType);
       continue;
     }
 
-    // Use the stamped scope-level classification.
     FailureOr<EngineType> opType = getStampedEngineType(&op);
     if (failed(opType))
       return failure();
-    if (*opType != keepType) {
-      topLevelToErase.push_back(&op);
-    }
+    if (*opType != keepType)
+      toErase.push_back(&op);
   }
 
-  for (Operation *op : llvm::reverse(topLevelToErase)) {
+  size_t erasedCount = toErase.size();
+  for (Operation *op : llvm::reverse(toErase)) {
     OpBuilder builder(op);
     for (Value result : op->getResults()) {
-      if (!result.use_empty()) {
-        Value placeholder = buildNeutralPlaceholder(builder, result.getType(), op->getLoc());
-        if (placeholder){
-          result.replaceAllUsesWith(placeholder);
-        }
-        else {
-          op->emitError("cannot build a neutral placeholder for live result ")
-              << result.getType();
-          return failure();
-        }
+      if (result.use_empty())
+        continue;
+
+      Value placeholder =
+          buildNeutralPlaceholder(builder, result.getType(), op->getLoc());
+      if (!placeholder) {
+        op->emitError("cannot build a neutral placeholder for live result ")
+            << result.getType();
+        return failure();
       }
+      result.replaceAllUsesWith(placeholder);
     }
     op->erase();
   }
 
-  // Second pass: strip wrong-type ops inside scf.for loop bodies
-  int loopErased = 0;
+  return erasedCount;
+}
+
+static LogicalResult stripWrongTypeOps(scope::ScopeOp scopeOp,
+                                       EngineType keepType) {
+  llvm::errs() << "[cv-split] Stripping "
+               << (keepType == EngineType::CUBE ? "VECTOR" : "CUBE")
+               << " ops from " << engineTypeToStr(keepType) << " scope\n";
+
+  Block &scopeBlock = scopeOp.getBodyRegion().front();
+
+  FailureOr<size_t> topLevelErased =
+      stripWrongTypeOpsFromBlock(scopeBlock, keepType);
+  if (failed(topLevelErased))
+    return failure();
+
+  size_t loopErased = 0;
   WalkResult walkResult = scopeOp.walk([&](scf::ForOp forOp) {
-    Block *body = forOp.getBody();
-    auto *yieldOp = body->getTerminator();
-
-    SmallVector<Operation *> toErase;
-    for (Operation &op : *body) {
-      if (&op == yieldOp) continue;
-      if (isa<arith::ConstantOp>(&op)) {
-        // Constants are deliberately replicated. Stamp each copy with its
-        // containing scope so the intermediate classification stays truthful.
-        setOpEngineTypeAttr(&op, keepType);
-        continue;
-      }
-
-      // Keep scalar/index ops
-      bool allScalar = true;
-      for (Value res : op.getResults()) {
-        Type t = res.getType();
-        if (!t.isIntOrIndexOrFloat()) {
-          allScalar = false;
-          break;
-        }
-      }
-      if (allScalar && op.getNumResults() > 0) {
-        setOpEngineTypeAttr(&op, keepType);
-        continue;
-      }
-      
-      // Use the stamped scope-level classification.
-      FailureOr<EngineType> opType = getStampedEngineType(&op);
-      if (failed(opType))
-        return WalkResult::interrupt();
-      if (*opType != keepType)
-        toErase.push_back(&op);
-    }
-
-    for (Operation *op : llvm::reverse(toErase)) {
-      OpBuilder builder(op);
-      for (Value result : op->getResults()) {
-        if (!result.use_empty()) {
-          Value placeholder = buildNeutralPlaceholder(builder, result.getType(), op->getLoc());
-          if (placeholder)
-            result.replaceAllUsesWith(placeholder);
-          else {
-            op->emitError("cannot build a neutral placeholder for live result ")
-                << result.getType();
-            return WalkResult::interrupt();
-          }
-        }
-      }
-      op->erase();
-    }
-    loopErased += toErase.size();
+    FailureOr<size_t> erased =
+        stripWrongTypeOpsFromBlock(*forOp.getBody(), keepType);
+    if (failed(erased))
+      return WalkResult::interrupt();
+    loopErased += *erased;
     return WalkResult::advance();
   });
   if (walkResult.wasInterrupted())
     return failure();
 
-  llvm::errs() << "[cv-split]   Erased " << topLevelToErase.size() << " top-level + "
-               << loopErased << " loop ops from " << engineTypeToStr(keepType) << " scope\n";
+  llvm::errs() << "[cv-split]   Erased " << *topLevelErased << " top-level + "
+               << loopErased << " loop ops from "
+               << engineTypeToStr(keepType) << " scope\n";
 
   // Final cleanup: remove dead allocs whose only users are annotation.mark
-  SmallVector<Operation *> deadOps;
+  SmallVector<Operation *> deadMarks;
+  SmallVector<memref::AllocOp> deadAllocs;
   scopeOp.walk([&](memref::AllocOp allocOp) {
     Value result = allocOp.getResult();
-    bool allUsersDead = true;
+    bool allUsersAreAnnotations = true;
     SmallVector<Operation *> markUsers;
     for (Operation *user : result.getUsers()) {
       if (isa<annotation::MarkOp>(user)) {
         markUsers.push_back(user);
       } else {
-        allUsersDead = false;
+        allUsersAreAnnotations = false;
         break;
       }
     }
-    if (allUsersDead && result.use_empty()) {
-      deadOps.push_back(allocOp);
-    } else if (allUsersDead && !markUsers.empty()) {
-      for (auto *m : markUsers) deadOps.push_back(m);
-      deadOps.push_back(allocOp);
+    if (allUsersAreAnnotations) {
+      deadMarks.append(markUsers);
+      deadAllocs.push_back(allocOp);
     }
   });
-  for (Operation *op : llvm::reverse(deadOps)) {
-    if (isa<annotation::MarkOp>(op))
-      op->erase();
+  for (Operation *markOp : llvm::reverse(deadMarks))
+    markOp->erase();
+  for (memref::AllocOp allocOp : llvm::reverse(deadAllocs)) {
+    assert(allocOp->use_empty() && "dead allocation still has users");
+    allocOp.erase();
   }
-  for (Operation *op : llvm::reverse(deadOps)) {
-    if (isa<memref::AllocOp>(op) && op->use_empty())
-      op->erase();
-  }
-  if (!deadOps.empty())
-    llvm::errs() << "[cv-split]   Cleaned up " << deadOps.size() << " dead alloc/mark ops\n";
+  if (!deadMarks.empty() || !deadAllocs.empty())
+    llvm::errs() << "[cv-split]   Cleaned up "
+                 << deadMarks.size() + deadAllocs.size()
+                 << " dead alloc/mark ops\n";
   return success();
 }
 
@@ -316,7 +307,7 @@ static void rowLoopifyVectorScope(scope::ScopeOp vecScope);
 static void serializeVectorScopeByInstance(scope::ScopeOp vecScope);
 static void rewriteNZTransposePacks(scope::ScopeOp vecScope);
 static void coalesceAdjacentSimdScopes(scope::ScopeOp vecScope);
-static void sinkCubeLoadChainsToMatmul(scope::ScopeOp cubeScope);
+static void sinkCubeLoadChainsToMatmul(Block *body);
 static void hoistVectorStateToMemUnique(scope::ScopeOp vecScope);
 
 // Sink each cube matmul's operand load chain to immediately before the matmul.
@@ -325,86 +316,110 @@ static void hoistVectorStateToMemUnique(scope::ScopeOp vecScope);
 // For each linalg.matmul in the cube loop body (program order), gather the
 // backward "load chain" of ops feeding its tensor operands -- restricted to the
 // same block and to load-chain op types (reinterpret_cast / alloc / memref.copy
-// / to_tensor / transpose). An op is only moved if every use of it is internal
-// to the chain or the matmul itself, so shared operands (the loop-invariant Q
-// cbuf, the P pack consumed by all PV matmuls, accumulator fill tensors) are
-// left in place. The collected ops are moved (in their existing relative order,
-// preserving topological validity) to just before the matmul.
-static void sinkCubeLoadChainsToMatmul(scope::ScopeOp cubeScope) {
+// / to_tensor / transpose). An op is moved only if it belongs to exactly one
+// matmul chain and every use of its results is internal to that chain or its
+// matmul. This leaves shared operands (the loop-invariant Q cbuf, the P pack
+// consumed by all PV matmuls, accumulator fill tensors) in place while moving
+// private portions of each chain. Movable ops retain their existing relative
+// order and are placed immediately before their matmul.
+static void sinkCubeLoadChainsToMatmul(Block *body) {
   auto isChainType = [](Operation *o) {
     return isa<memref::ReinterpretCastOp, memref::AllocOp, memref::CopyOp,
                bufferization::ToTensorOp, linalg::TransposeOp>(o);
   };
 
-  cubeScope.walk([&](scf::ForOp forOp) {
-    Block *body = forOp.getBody();
+  struct MatmulChain {
+    explicit MatmulChain(Operation *matmul) : matmul(matmul) {}
+    Operation *matmul;
+    SetVector<Operation *> ops;
+  };
 
-    SmallVector<Operation *> matmuls;
-    for (Operation &op : *body)
-      if (isa<linalg::MatmulOp, linalg::MatmulTransposeBOp>(op))
-        matmuls.push_back(&op);
+  SmallVector<MatmulChain> chains;
+  DenseMap<Operation *, unsigned> chainUseCount;
 
-    for (Operation *mm : matmuls) {
-      // 1. Build the candidate chain via a worklist over operands. memref.copy
-      //    writes its dst alloc by side effect (no SSA result), so when we reach
-      //    an alloc we also pull in the copy that writes it and that copy's
-      //    source (reinterpret_cast).
-      SetVector<Operation *> chain;
-      SmallVector<Value> worklist(mm->operand_begin(), mm->operand_end());
+  for (Operation &op : *body)
+    if (isa<linalg::MatmulOp, linalg::MatmulTransposeBOp>(op))
+      chains.emplace_back(&op);
 
-      auto enqueueOperands = [&](Operation *op) {
-        for (Value v : op->getOperands())
-          worklist.push_back(v);
-      };
+  for (MatmulChain &matmulChain : chains) {
+    // 1. Build the candidate chain via a worklist over operands. memref.copy
+    //    writes its dst alloc by side effect (no SSA result), so when we reach
+    //    an alloc we also pull in the copy that writes it and that copy's
+    //    source (reinterpret_cast).
+    Operation *mm = matmulChain.matmul;
+    SetVector<Operation *> &chain = matmulChain.ops;
+    SmallVector<Value> worklist(mm->operand_begin(), mm->operand_end());
 
-      while (!worklist.empty()) {
-        Value v = worklist.pop_back_val();
-        Operation *def = v.getDefiningOp();
-        if (!def || def->getBlock() != body || !isChainType(def))
-          continue;
-        if (!chain.insert(def))
-          continue;
-        enqueueOperands(def);
-        // For an alloc, find the memref.copy in this block that writes it.
-        if (isa<memref::AllocOp>(def)) {
-          for (Operation *user : def->getResult(0).getUsers()) {
-            auto copy = dyn_cast<memref::CopyOp>(user);
-            if (copy && copy->getBlock() == body &&
-                copy.getTarget() == def->getResult(0)) {
-              if (chain.insert(copy))
-                enqueueOperands(copy);
+    auto enqueueOperands = [&](Operation *op) {
+      for (Value v : op->getOperands())
+        worklist.push_back(v);
+    };
+
+    while (!worklist.empty()) {
+      Value v = worklist.pop_back_val();
+      Operation *def = v.getDefiningOp();
+      if (!def || def->getBlock() != body || !isChainType(def))
+        continue;
+      if (!chain.insert(def))
+        continue;
+      ++chainUseCount[def];
+      enqueueOperands(def);
+      // For an alloc, find the memref.copy in this block that writes it.
+      if (isa<memref::AllocOp>(def)) {
+        for (Operation *user : def->getResult(0).getUsers()) {
+          auto copy = dyn_cast<memref::CopyOp>(user);
+          if (copy && copy->getBlock() == body &&
+              copy.getTarget() == def->getResult(0)) {
+            if (chain.insert(copy)) {
+              ++chainUseCount[copy.getOperation()];
+              enqueueOperands(copy);
             }
           }
         }
       }
-
-      // 2. Keep only ops that are safe to move: every user of the op's results
-      //    must be inside the chain or be this matmul. (memref.copy has no
-      //    results, so it is always safe once its alloc is in the chain.)
-      auto safeToMove = [&](Operation *op) {
-        if (isa<memref::CopyOp>(op))
-          return chain.contains(op->getOperand(1).getDefiningOp());
-        for (Operation *user : op->getUsers())
-          if (user != mm && !chain.contains(user))
-            return false;
-        return true;
-      };
-
-      SmallVector<Operation *> movable;
-      for (Operation *op : chain)
-        if (safeToMove(op))
-          movable.push_back(op);
-
-      // 3. Move in existing program order so relative topological order holds.
-      llvm::sort(movable, [](Operation *a, Operation *b) {
-        return a->isBeforeInBlock(b);
-      });
-      for (Operation *op : movable)
-        op->moveBefore(mm);
     }
-  });
-}
+  }
 
+  // 2. Select private operations independently within each chain. An operation
+  //    shared by multiple matmul chains stays in place. For result-producing
+  //    operations, all users must remain inside this chain or be its matmul.
+  //    memref.copy has no result, so its destination allocation must also be
+  //    private to this chain.
+  auto safeToMove = [&](Operation *op, Operation *mm,
+                        const SetVector<Operation *> &chain) {
+    if (chainUseCount.lookup(op) != 1)
+      return false;
+
+    if (auto copy = dyn_cast<memref::CopyOp>(op)) {
+      Operation *target = copy.getTarget().getDefiningOp();
+      return target && chain.contains(target) &&
+             chainUseCount.lookup(target) == 1;
+    }
+
+    for (Operation *user : op->getUsers())
+      if (user != mm && !chain.contains(user))
+        return false;
+    return true;
+  };
+
+  for (MatmulChain &matmulChain : chains) {
+    Operation *mm = matmulChain.matmul;
+    SetVector<Operation *> &chain = matmulChain.ops;
+
+    SmallVector<Operation *> movable;
+
+    for (Operation *op : chain)
+      if (safeToMove(op, mm, chain))
+        movable.push_back(op);
+
+    // 3. Move in existing program order so relative topological order holds.
+    llvm::sort(movable, [](Operation *a, Operation *b) {
+      return a->isBeforeInBlock(b);
+    });
+    for (Operation *op : movable)
+      op->moveBefore(mm);
+  }
+}
 
 // ============================================================================
 // ROW_SPLIT vector re-tile.
@@ -2021,7 +2036,8 @@ LogicalResult createScopeSeparation(
   Block *cubeBlock = &cubeScope.getBodyRegion().front();
   OpBuilder cubeBuilder(cubeBlock, cubeBlock->end());
   IRMapping cubeMapping;
-  cubeBuilder.clone(*innerLoop.getOperation(), cubeMapping);
+  auto cubeLoop = cast<scf::ForOp>(
+      cubeBuilder.clone(*innerLoop.getOperation(), cubeMapping));
   cubeBuilder.create<scope::ReturnOp>(loc);
 
   // Step 2: Create VECTOR scope (wraps the original inner loop + epilogue)
@@ -2059,35 +2075,36 @@ LogicalResult createScopeSeparation(
   // Step 6: Hoist convert_layout ops out of the CUBE scope's loop.
   // These are view reshapes on L1 buffers (NZ→ND) that don't depend on loop
   // iteration state — they can be computed once before the loop starts.
-  cubeScope.walk([&](scf::ForOp forOp) {
-    Block *loopBody = forOp.getBody();
+  {
+    Block *loopBody = cubeLoop.getBody();
     SmallVector<hivm::ConvertLayoutOp> toHoist;
     SmallVector<memref::MemorySpaceCastOp> castsToHoist;
     for (Operation &op : *loopBody) {
       if (auto cvtOp = dyn_cast<hivm::ConvertLayoutOp>(&op)) {
         // Only hoist if its input is defined OUTSIDE the loop (shared L1 alloc)
-        Value input = cvtOp.getOperand(0);
-        if (input.getDefiningOp() &&
-            input.getDefiningOp()->getBlock() != loopBody) {
+        Value input = cvtOp.getSource();
+        bool conversionIsLoopInvariant =
+            input.getDefiningOp() &&
+            input.getDefiningOp()->getBlock() != loopBody;
+        if (conversionIsLoopInvariant) {
           toHoist.push_back(cvtOp);
-        }
-      }
-    }
-    // Also hoist memory_space_cast that directly consumes a hoisted convert_layout
-    for (auto cvtOp : toHoist) {
-      for (Operation *user : cvtOp.getResult().getUsers()) {
-        if (auto castOp = dyn_cast<memref::MemorySpaceCastOp>(user)) {
-          if (castOp->getBlock() == loopBody)
-            castsToHoist.push_back(castOp);
+
+          // Hoist the pure memory-space view that directly consumes this
+          // conversion. The later to_tensor remains after synchronization.
+          for (Operation *user : cvtOp.getResult().getUsers()) {
+            if (auto castOp = dyn_cast<memref::MemorySpaceCastOp>(user);
+                castOp && castOp->getBlock() == loopBody)
+              castsToHoist.push_back(castOp);
+          }
         }
       }
     }
     // Move them before the loop (inside the scope block, before the scf.for)
     for (auto cvtOp : toHoist)
-      cvtOp->moveBefore(forOp);
+      cvtOp->moveBefore(cubeLoop);
     for (auto castOp : castsToHoist)
-      castOp->moveBefore(forOp);
-  });
+      castOp->moveBefore(cubeLoop);
+  }
 
   // Step 6b: Sink each cube matmul's operand load chain to immediately before
   // the matmul. The BFS level scheduler (stage 7) groups every unrolled K/V
@@ -2097,7 +2114,9 @@ LogicalResult createScopeSeparation(
   // simulator's dmamov_decode_to_fb path rejects. Interleaving the loads (the
   // manual kernel allocates one K tile right before each matmul) keeps only the
   // in-flight operands live -> low static offsets -> immediate offset mode.
-  sinkCubeLoadChainsToMatmul(cubeScope);
+  dumpScopeDebugIR(cubeScope, "sinkCubeLoadChainsToMatmul_before.mlir");
+  sinkCubeLoadChainsToMatmul(cubeLoop.getBody());
+  dumpScopeDebugIR(cubeScope, "sinkCubeLoadChainsToMatmul_after.mlir");
 
   // Step 7: ROW_SPLIT re-tile of the VECTOR scope (16 rows per veccore, both
   // veccores active). Replaces the single-veccore NO_DUAL guard.

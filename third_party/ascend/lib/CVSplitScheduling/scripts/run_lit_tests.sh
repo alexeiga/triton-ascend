@@ -7,6 +7,7 @@ TEST="$REPO/third_party/ascend/unittest/Conversion/General/CVSplitScheduling/cv_
 SINGLE_CORE_TEST="$REPO/third_party/ascend/unittest/Conversion/General/CVSplitScheduling/cv_split_classification_single_core.mlir"
 MIXED_CORE_TEST="$REPO/third_party/ascend/unittest/Conversion/General/CVSplitScheduling/cv_split_classification_mixed_core.mlir"
 FA_TEST="$REPO/third_party/ascend/unittest/Conversion/General/CVSplitScheduling/cv_split_scheduling_fa.mlir"
+SCOPE_HOISTING_TEST="$REPO/third_party/ascend/unittest/Conversion/General/CVSplitScheduling/cv_split_scope_hoisting.mlir"
 VERBOSE=false
 
 case "${1:-}" in
@@ -196,5 +197,9 @@ echo "    PASS: accepted mixed-core loop"
 echo ">>> CVSplit full Flash Attention lit test"
 run_stdout_filecheck "$FA_TEST" 4 "$TMP_DIR/fa.log"
 echo "    PASS: full Flash Attention transformation"
+
+echo ">>> CVSplit scope hoisting lit test"
+run_stdout_filecheck "$SCOPE_HOISTING_TEST" 4 "$TMP_DIR/scope-hoisting.log"
+echo "    PASS: hoisted invariant CUBE layout view"
 
 echo ">>> all CVSplit lit tests passed"
