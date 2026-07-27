@@ -35,7 +35,7 @@
 // CHECK-NEXT: %{{.*}} = hivm.hir.convert_layout %{{.*}} output_shape [32, 32] {dstLayout = #hivm.data_layout<ND>, srcLayout = #hivm.data_layout<ND>} : (memref<2x2x16x16xf16, #hivm.address_space<cbuf>>) -> memref<32x32xf16, #hivm.address_space<cbuf>>
 // CHECK-NEXT: %{{.*}} = memref.memory_space_cast %{{.*}} : memref<32x32xf16, #hivm.address_space<cbuf>> to memref<32x32xf16>
 // CHECK-NEXT: %{{.*}} = memref.memory_space_cast %{{.*}} : memref<32x32xf16, #hivm.address_space<cbuf>> to memref<32x32xf16>
-// CHECK-NEXT: %{{.*}}:5 = scf.for %{{.*}} = %{{.*}} to %{{.*}} step %{{.*}} iter_args(%{{.*}} = %{{.*}}, %{{.*}} = %{{.*}}, %{{.*}} = %{{.*}}, %{{.*}} = %{{.*}}, %{{.*}} = %{{.*}}) -> (tensor<32xf32>, tensor<32x64xf32>, tensor<32xf32>, i32, i32) : i32 {
+// CHECK-NEXT: %{{.*}}:2 = scf.for %{{.*}} = %{{.*}} to %{{.*}} step %{{.*}} iter_args(%{{.*}} = %{{.*}}, %{{.*}} = %{{.*}}) -> (i32, i32) : i32 {
 
 // CHECK: hivm.hir.fixpipe {dma_mode = #hivm.dma_mode{{<}}nz2nd{{>}}} ins(%{{.*}} : tensor<32x32xf32>) outs(%{{.*}} : memref<16x32xf32, #hivm.address_space<ub>>) dual_dst_mode = {{<}}ROW_SPLIT{{>}}
 // CHECK-NEXT: hivm.hir.sync_block_set[<CUBE>, <PIPE_FIX>, <PIPE_V>] flag = 0

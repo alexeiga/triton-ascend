@@ -251,6 +251,68 @@ static LogicalResult stripWrongTypeOps(scope::ScopeOp scopeOp,
   return success();
 }
 
+// Rebuild an scf.for without loop-carried values that are unused both inside
+// the body and outside the loop. The init operand, region iter argument, loop
+// result, and yield operand at each removed index are dropped together.
+static scf::ForOp removeUnusedLoopCarriedValues(scf::ForOp loop) {
+  SmallVector<unsigned> keptIndices;
+  unsigned numIterArgs = loop.getNumRegionIterArgs();
+  keptIndices.reserve(numIterArgs);
+  for (unsigned i = 0; i < numIterArgs; ++i) {
+    if (!loop.getRegionIterArgs()[i].use_empty() ||
+        !loop.getResult(i).use_empty())
+      keptIndices.push_back(i);
+  }
+
+  if (keptIndices.size() == numIterArgs)
+    return loop;
+
+  auto oldYield = cast<scf::YieldOp>(loop.getBody()->getTerminator());
+  SmallVector<Value> newInitArgs;
+  SmallVector<Value> newYieldValues;
+  newInitArgs.reserve(keptIndices.size());
+  newYieldValues.reserve(keptIndices.size());
+  for (unsigned oldIndex : keptIndices) {
+    newInitArgs.push_back(loop.getInitArgs()[oldIndex]);
+    newYieldValues.push_back(oldYield.getOperand(oldIndex));
+  }
+
+  OpBuilder builder(loop);
+  auto newLoop = builder.create<scf::ForOp>(
+      loop.getLoc(), loop.getLowerBound(), loop.getUpperBound(), loop.getStep(),
+      newInitArgs);
+  newLoop->setAttrs(loop->getAttrs());
+
+  Block *oldBody = loop.getBody();
+  Block *newBody = newLoop.getBody();
+  loop.getInductionVar().replaceAllUsesWith(newLoop.getInductionVar());
+  for (auto [newIndex, oldIndex] : llvm::enumerate(keptIndices))
+    loop.getRegionIterArgs()[oldIndex].replaceAllUsesWith(
+        newLoop.getRegionIterArgs()[newIndex]);
+
+  // Depending on the builder overload, the fresh body is either empty or has
+  // an empty scf.yield. Remove that placeholder and build the real yield after
+  // moving the original body operations.
+  if (!newBody->empty()) {
+    assert(isa<scf::YieldOp>(newBody->back()) &&
+           "fresh scf.for body must contain only its yield");
+    newBody->back().erase();
+  }
+  while (&oldBody->front() != oldYield.getOperation())
+    oldBody->front().moveBefore(newBody, newBody->end());
+  OpBuilder yieldBuilder = OpBuilder::atBlockEnd(newBody);
+  yieldBuilder.create<scf::YieldOp>(oldYield.getLoc(), newYieldValues);
+
+  for (auto [newIndex, oldIndex] : llvm::enumerate(keptIndices))
+    loop.getResult(oldIndex).replaceAllUsesWith(newLoop.getResult(newIndex));
+
+  unsigned removedCount = numIterArgs - keptIndices.size();
+  loop.erase();
+  llvm::errs() << "[cv-split]   Removed " << removedCount
+               << " unused loop-carried value(s)\n";
+  return newLoop;
+}
+
 // ============================================================================
 // Single-veccore output guard.
 // With NO_DUAL fixpipe, the cube delivers the whole MxN tile to one sub-block's
@@ -301,7 +363,9 @@ static void guardStoresToSubBlock0(scope::ScopeOp vecScope) {
                << " tail ops) in if(get_sub_block_idx==0)\n";
 }
 
-static void retileVectorScopeForRowSplit(scope::ScopeOp vecScope);
+static LogicalResult
+retileVectorScopeForRowSplit(scope::ScopeOp vecScope,
+                             const CrossScopeTransferInfo &transferInfo);
 static void wrapSimdScopes(scope::ScopeOp vecScope);
 static void rowLoopifyVectorScope(scope::ScopeOp vecScope);
 static void serializeVectorScopeByInstance(scope::ScopeOp vecScope);
@@ -433,11 +497,9 @@ static void sinkCubeLoadChainsToMatmul(Block *body) {
 //   - output store offset += sub_block_idx * 16 * leadingStride, sizes M=16
 // Both veccores then do useful work (2x vector throughput), matching the target.
 // ============================================================================
-// Halve the leading (M) dim of a [Mfull, ..] tensor/memref to Mfull/2 (the
-// per-veccore band under ROW_SPLIT). Generic over the tile size: BLOCK_M=32 ->
-// 16, BLOCK_M=64 -> 32, BLOCK_M=128 -> 64 (matching target_optimized.ir, whose
-// vector scope runs at BLOCK_M/2 = 64 rows). Types whose leading dim != Mfull
-// pass through unchanged.
+// Change the leading dimension of a [BLOCK_M, ...] tensor or memref to
+// [BLOCK_M/2, ...], giving each vector core its ROW_SPLIT row band. Types whose
+// leading dimension is not BLOCK_M pass through unchanged.
 static Type retileRowHalve(Type t, int64_t Mfull) {
   int64_t half = Mfull / 2;
   if (auto rt = dyn_cast<RankedTensorType>(t)) {
@@ -445,7 +507,7 @@ static Type retileRowHalve(Type t, int64_t Mfull) {
     if (!sh.empty() && sh[0] == Mfull) {
       SmallVector<int64_t> ns(sh.begin(), sh.end());
       ns[0] = half;
-      return RankedTensorType::get(ns, rt.getElementType());
+      return RankedTensorType::get(ns, rt.getElementType(), rt.getEncoding());
     }
   } else if (auto mt = dyn_cast<MemRefType>(t)) {
     auto sh = mt.getShape();
@@ -457,26 +519,6 @@ static Type retileRowHalve(Type t, int64_t Mfull) {
     }
   }
   return t;
-}
-
-// Detect the full tile row count (BLOCK_M) of a freshly-cloned VECTOR scope:
-// the leading dim of the final output store source ([BLOCK_M, HEAD_DIM]).
-// Falls back to the max rank>=2 leading dim, then to 32. Must run BEFORE retile.
-static int64_t detectTileRows(scope::ScopeOp vecScope) {
-  int64_t M = 0;
-  vecScope.walk([&](bufferization::MaterializeInDestinationOp m) {
-    if (auto rt = dyn_cast<RankedTensorType>(m.getSource().getType()))
-      if (rt.getRank() >= 1 && !rt.isDynamicDim(0))
-        M = std::max(M, rt.getShape()[0]);
-  });
-  if (M == 0)
-    vecScope.walk([&](Operation *op) {
-      for (Value r : op->getResults())
-        if (auto rt = dyn_cast<RankedTensorType>(r.getType()))
-          if (rt.getRank() >= 2 && !rt.isDynamicDim(0))
-            M = std::max(M, rt.getShape()[0]);
-    });
-  return M ? M : 32;
 }
 
 // V->C pack chain detached in step 2 and rebuilt per-veccore in step 6: the
@@ -503,47 +545,29 @@ static Value emitSubBlockIndex(scope::ScopeOp vecScope, Location loc) {
 // (truncf -> reshape -> transpose -> reshape -> to_memref -> cast -> copy),
 // recording each P source / L1 alloc / insertion anchor so step 6 can rebuild a
 // per-veccore pack. The truncf (the actual P value) is kept; the rest is erased.
-static SmallVector<VectorToCubePack>
-detachVectorToCubePacks(scope::ScopeOp vecScope) {
-  Block &block = vecScope.getBodyRegion().front();
+static SmallVector<VectorToCubePack> detachVectorToCubePacks(
+    scope::ScopeOp vecScope,
+    ArrayRef<VectorToCubeTransferChain> vectorToCubeChains) {
   SmallVector<VectorToCubePack> packs;
   SmallVector<Operation *> toErase;
-  block.walk([&](hivm::CopyOp copy) {
-    Value src = copy.getOperand(0);   // UB memspacecast
-    Value dst = copy.getOperand(1);   // L1 alloc
-    Operation *anchor = copy->getNextNode();
-    SmallVector<Operation *> chain;
-    chain.push_back(copy);
-    Operation *cur = src.getDefiningOp(); // memspacecast
-    Value pSrc;
-    // walk: memspacecast <- to_memref <- reshape2 <- transpose <- reshape1 <- truncf
-    while (cur) {
-      chain.push_back(cur);
-      if (isa<arith::TruncFOp>(cur)) { pSrc = cur->getResult(0); break; }
-      if (cur->getNumOperands() == 0) break;
-      cur = cur->getOperand(0).getDefiningOp();
-    }
-    // pSrc is the truncf result; keep truncf (pop it from erase list)
-    if (pSrc && isa<arith::TruncFOp>(chain.back()))
-      chain.pop_back();
-    packs.push_back({pSrc, dst, anchor});
-    for (auto *o : chain) toErase.push_back(o);
-  });
-  for (Operation *o : toErase) {
-    o->dropAllUses();
-    o->erase();
+  for (const VectorToCubeTransferChain &chain : vectorToCubeChains) {
+    packs.push_back({chain.pSrc, chain.l1Alloc, chain.anchor});
+    llvm::append_range(toErase, chain.operationsToErase);
   }
+  // The handles were recorded in creation order; erase users before their
+  // defining operations.
+  for (Operation *o : llvm::reverse(toErase))
+    o->erase();
   return packs;
 }
 
-// Step 3: clone function-level 32-row init fills/empties as 16-row and rewrite
-// only the vector-scope uses (these inits are shared with the CUBE scope, so we
-// must not retile them in place). Returns the number of clones created.
+// Step 3: clone external BLOCK_M-row init fills/empties with BLOCK_M/2 rows and
+// rewrite only the VECTOR-scope uses. These inits may still be shared with the
+// CUBE scope, so they must not be retiled in place. Returns the clone count.
 static unsigned cloneExternalInitsAsHalfHeight(scope::ScopeOp vecScope,
                                                Location loc, int64_t Mfull) {
-  // These are shared with the CUBE scope (e.g. a 32x32 empty feeds both the
-  // matmul init and the vector scale fill), so we must NOT retile them in
-  // place; instead clone a 16-row version and rewrite only the vector uses.
+  // Clone each full-height initializer instead of changing the original:
+  // CUBE retains [BLOCK_M, ...], while VECTOR uses [BLOCK_M/2, ...].
   DenseSet<Operation *> vecOps;
   vecScope.walk([&](Operation *o) { vecOps.insert(o); });
   OpBuilder cb(vecScope);
@@ -561,13 +585,22 @@ static unsigned cloneExternalInitsAsHalfHeight(scope::ScopeOp vecScope,
       if (it != cloneMap.end()) {
         repl = it->second;
       } else {
-        auto ntt = cast<RankedTensorType>(retileRowHalve(rt, Mfull));
+        Type retiledType = retileRowHalve(rt, Mfull);
+        auto ntt = cast<RankedTensorType>(retiledType);
+        SmallVector<int64_t> expectedShape(rt.getShape());
+        expectedShape[0] = Mfull / 2;
+        auto expectedType = RankedTensorType::get(
+            expectedShape, rt.getElementType(), rt.getEncoding());
+        assert(ntt == expectedType &&
+               "retile must only halve the BLOCK_M dimension");
         if (auto fill = dyn_cast<linalg::FillOp>(d)) {
-          Value ne = cb.create<tensor::EmptyOp>(loc, ntt.getShape(), ntt.getElementType());
+          Value ne = cb.create<tensor::EmptyOp>(
+              loc, ntt.getShape(), ntt.getElementType(), ntt.getEncoding());
           repl = cb.create<linalg::FillOp>(loc, fill.getInputs(),
                                            ValueRange{ne}).getResult(0);
         } else if (isa<tensor::EmptyOp>(d)) {
-          repl = cb.create<tensor::EmptyOp>(loc, ntt.getShape(), ntt.getElementType());
+          repl = cb.create<tensor::EmptyOp>(
+              loc, ntt.getShape(), ntt.getElementType(), ntt.getEncoding());
         } else {
           continue;
         }
@@ -577,32 +610,49 @@ static unsigned cloneExternalInitsAsHalfHeight(scope::ScopeOp vecScope,
       opd.set(repl);
     }
   });
+  // FIXME: The original tensor.empty/linalg.fill initializers can become dead
+  // after all VECTOR uses are redirected. Downstream canonicalization is
+  // expected to erase them; add targeted cleanup here if that is not guaranteed
+  // by every pipeline that runs this pass.
   return clonedCount;
 }
 
-// Steps 4 & 4.5: retile every in-scope op result (and loop-carried arg) from 32
-// to 16 rows, then repair any DPS tensor.empty init whose type drifted from its
-// retiled result. (arith.constant splats get their value attr rebuilt;
-// reinterpret_cast is handled in steps 5/6 and skipped here.)
-static void retileVectorScopeOps(scope::ScopeOp vecScope, int64_t Mfull) {
+// Steps 4 & 4.5: retile every in-scope op result (and loop-carried arg) from
+// BLOCK_M to BLOCK_M/2 rows, then repair any DPS tensor.empty init whose type
+// drifted from its retiled result. (arith.constant splats get their value attr
+// rebuilt; reinterpret_cast is handled in steps 5/6 and skipped here.)
+static LogicalResult retileVectorScopeOps(scope::ScopeOp vecScope,
+                                          int64_t Mfull) {
   // ---- 4. Generic re-tile of every vector op (skip reinterpret_cast) ----
-  vecScope.walk([&](Operation *op) {
-    if (isa<memref::ReinterpretCastOp>(op)) return;
-    // arith.constant: rebuild the splat value attr to match the retiled type
-    // (e.g. the dead PV zero-init clone left in the vector scope).
-    if (auto c = dyn_cast<arith::ConstantOp>(op)) {
-      Type nt = retileRowHalve(c.getType(), Mfull);
-      if (nt != c.getType()) {
-        if (auto dense = dyn_cast<DenseElementsAttr>(c.getValue())) {
-          if (dense.isSplat()) {
-            auto nst = cast<ShapedType>(nt);
-            c.setValueAttr(DenseElementsAttr::get(nst, dense.getSplatValue<Attribute>()));
-            c.getResult().setType(nt);
-          }
-        }
-      }
-      return;
+  SmallVector<arith::ConstantOp> constants;
+  vecScope.walk(
+      [&](arith::ConstantOp constant) { constants.push_back(constant); });
+
+  for (arith::ConstantOp c : constants) {
+    Type nt = retileRowHalve(c.getType(), Mfull);
+    if (nt == c.getType())
+      continue;
+
+    auto dense = dyn_cast<DenseElementsAttr>(c.getValue());
+    if (!dense || !dense.isSplat()) {
+      c.emitError("VECTOR retiling only supports shaped splat constants");
+      return failure();
     }
+
+    auto nst = cast<ShapedType>(nt);
+    c.setValueAttr(
+        DenseElementsAttr::get(nst, dense.getSplatValue<Attribute>()));
+    c.getResult().setType(nt);
+  }
+
+  vecScope.walk([&](Operation *op) {
+    // Its explicit offset/size/stride metadata must be rebuilt together with
+    // its type. Output casts are handled by retileOutputStores(); V->C packing
+    // views are reconstructed by rebuildVectorToCubePacks().
+    // Constants are also skipped because they were re-tiled above together
+    // with their value attributes.
+    if (isa<memref::ReinterpretCastOp, arith::ConstantOp>(op))
+      return;
     for (Value r : op->getResults())
       r.setType(retileRowHalve(r.getType(), Mfull));
     if (auto f = dyn_cast<scf::ForOp>(op)) {
@@ -613,29 +663,30 @@ static void retileVectorScopeOps(scope::ScopeOp vecScope, int64_t Mfull) {
     }
   });
 
-  // ---- 4.5. Safety net: fix any in-scope DPS *empty* init whose type no longer
-  // matches its (retiled) result (a tensor.empty is a pure destination, so a
-  // fresh correctly-typed empty is always safe; do NOT touch fill/reduce inits
-  // which carry meaningful identity values). ----
-  vecScope.walk([&](Operation *op) {
-    auto dps = dyn_cast<DestinationStyleOpInterface>(op);
-    if (!dps) return;
-    for (unsigned i = 0; i < op->getNumResults(); ++i) {
-      OpOperand *io = dps.getDpsInitOperand(i);
-      Value init = io->get();
-      if (!init.getDefiningOp<tensor::EmptyOp>()) continue;
-      Type rt = op->getResult(i).getType();
-      if (init.getType() == rt) continue;
-      auto rtt = cast<RankedTensorType>(rt);
-      OpBuilder b(op);
-      io->set(b.create<tensor::EmptyOp>(op->getLoc(), rtt.getShape(),
-                                        rtt.getElementType()).getResult());
+  // Validate that the preceding retiling updated every tensor DPS init and its
+  // tied result consistently. Do not silently repair a missed transformation.
+  SmallVector<DestinationStyleOpInterface> dpsOps;
+  vecScope.walk(
+      [&](DestinationStyleOpInterface dps) { dpsOps.push_back(dps); });
+  for (DestinationStyleOpInterface dps : dpsOps) {
+    for (OpOperand &initOperand : dps.getDpsInitsMutable()) {
+      Value init = initOperand.get();
+      if (!isa<TensorType>(init.getType()))
+        continue;
+      OpResult result = dps.getTiedOpResult(&initOperand);
+      if (init.getType() != result.getType()) {
+        dps->emitError("VECTOR retiling produced mismatched DPS init/result "
+                       "types");
+        return failure();
+      }
     }
-  });
+  }
+  return success();
 }
 
-// Step 5: shift each output store to this veccore's 16-row band — offset +=
-// sub_block_idx * 16 * leadingStride, size M = 16. Returns the store count.
+// Step 5: shift each output store to this veccore's BLOCK_M/2-row band —
+// offset += sub_block_idx * (BLOCK_M/2) * leadingStride, size M = BLOCK_M/2.
+// Returns the store count.
 static unsigned retileOutputStores(scope::ScopeOp vecScope, Value sbidx,
                                    Location loc, int64_t Mfull) {
   int64_t half = Mfull / 2;
@@ -661,6 +712,8 @@ static unsigned retileOutputStores(scope::ScopeOp vecScope, Value sbidx,
     Value add = b.create<arith::MulIOp>(loc, sbidx, step);
     Value newOff = b.create<arith::AddIOp>(loc, origOff, add);
     sizes[0] = b.getIndexAttr(half);
+    // FIXME: return FailureOr<unsigned> and fail before mutation when the
+    // output memref does not retile from BLOCK_M to BLOCK_M/2.
     auto newType = cast<MemRefType>(retileRowHalve(ric.getType(), Mfull));
     auto newRic = b.create<memref::ReinterpretCastOp>(
         loc, newType, ric.getSource(), getAsOpFoldResult(newOff), sizes, strides);
@@ -726,28 +779,31 @@ static void rebuildVectorToCubePacks(ArrayRef<VectorToCubePack> packs,
 }
 
 // Re-tile the VECTOR scope for ROW_SPLIT so both veccores do useful work (2x
-// vector throughput): 16 rows per veccore, addressed by get_sub_block_idx,
+// vector throughput): M/2 rows per veccore, addressed by get_sub_block_idx,
 // matching the target IR. Runs the six steps in order; see each helper.
-static void retileVectorScopeForRowSplit(scope::ScopeOp vecScope) {
+static LogicalResult
+retileVectorScopeForRowSplit(scope::ScopeOp vecScope,
+                             const CrossScopeTransferInfo &transferInfo) {
   Location loc = vecScope.getLoc();
-  auto ubAddrSpace = OpBuilder(vecScope.getContext())
-      .getAttr<hivm::AddressSpaceAttr>(hivm::AddressSpace::UB);
+  MLIRContext *ctx = vecScope.getContext();
+  auto ubAddrSpace = hivm::AddressSpaceAttr::get(ctx, hivm::AddressSpace::UB);
+  int64_t blockM = transferInfo.blockM;
 
-  // Detect the tile height (BLOCK_M) before any retile mutates the types, so we
-  // retile Mfull -> Mfull/2 generically (32->16, 64->32, 128->64).
-  int64_t Mfull = detectTileRows(vecScope);
+  SmallVector<VectorToCubePack> packs =
+      detachVectorToCubePacks(vecScope, transferInfo.vectorToCubeChains);
 
   Value sbidx = emitSubBlockIndex(vecScope, loc);
-  SmallVector<VectorToCubePack> packs = detachVectorToCubePacks(vecScope);
-  unsigned clonedCount = cloneExternalInitsAsHalfHeight(vecScope, loc, Mfull);
-  retileVectorScopeOps(vecScope, Mfull);
-  unsigned nStores = retileOutputStores(vecScope, sbidx, loc, Mfull);
+  unsigned clonedCount = cloneExternalInitsAsHalfHeight(vecScope, loc, blockM);
+  if (failed(retileVectorScopeOps(vecScope, blockM)))
+    return failure();
+  unsigned nStores = retileOutputStores(vecScope, sbidx, loc, blockM);
   rebuildVectorToCubePacks(packs, sbidx, ubAddrSpace, loc);
 
-  llvm::errs() << "[cv-split]   ROW_SPLIT re-tile (BLOCK_M=" << Mfull << " -> "
-               << (Mfull / 2) << "/veccore): " << packs.size()
+  llvm::errs() << "[cv-split]   ROW_SPLIT re-tile (BLOCK_M=" << blockM << " -> "
+               << (blockM / 2) << "/veccore): " << packs.size()
                << " V->C packs, " << nStores << " stores, "
                << clonedCount << " ext consts cloned\n";
+  return success();
 }
 
 // ============================================================================
@@ -1976,7 +2032,8 @@ static void wrapSimdScopes(scope::ScopeOp vecScope) {
 
 LogicalResult createScopeSeparation(
     func::FuncOp funcOp, scf::ForOp innerLoop,
-    DenseMap<Operation *, EngineType> &classification) {
+    DenseMap<Operation *, EngineType> &classification,
+    const CrossScopeTransferInfo &transferInfo) {
 
   MLIRContext *ctx = funcOp.getContext();
   Location loc = innerLoop.getLoc();
@@ -2072,6 +2129,12 @@ LogicalResult createScopeSeparation(
       failed(stripWrongTypeOps(vecScope, EngineType::VECTOR)))
     return failure();
 
+  // Stripping can leave dead loop-carried state behind because the cloned
+  // loops retain the original init/result/yield signature. Remove only entries
+  // whose region argument and loop result are both unused.
+  cubeLoop = removeUnusedLoopCarriedValues(cubeLoop);
+  innerLoop = removeUnusedLoopCarriedValues(innerLoop);
+
   // Step 6: Hoist convert_layout ops out of the CUBE scope's loop.
   // These are view reshapes on L1 buffers (NZ→ND) that don't depend on loop
   // iteration state — they can be computed once before the loop starts.
@@ -2118,9 +2181,10 @@ LogicalResult createScopeSeparation(
   sinkCubeLoadChainsToMatmul(cubeLoop.getBody());
   dumpScopeDebugIR(cubeScope, "sinkCubeLoadChainsToMatmul_after.mlir");
 
-  // Step 7: ROW_SPLIT re-tile of the VECTOR scope (16 rows per veccore, both
-  // veccores active). Replaces the single-veccore NO_DUAL guard.
-  retileVectorScopeForRowSplit(vecScope);
+  // Step 7: ROW_SPLIT re-tile of the VECTOR scope (BLOCK_M/2 rows per veccore,
+  // both veccores active). Replaces the single-veccore NO_DUAL guard.
+  if (failed(retileVectorScopeForRowSplit(vecScope, transferInfo)))
+    return failure();
 
   // Stage 8: (experimental, default OFF) wrap pure elementwise vector compute
   // in vector_mode="simd" scopes. MEASURED RESULT (N=8192, 1 core): this is a

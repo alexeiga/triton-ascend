@@ -15,6 +15,7 @@
 #include "llvm/Support/raw_ostream.h"
 
 #include <cassert>
+#include <optional>
 
 namespace mlir::triton::cv_split {
 namespace {
@@ -292,11 +293,11 @@ static void emitCubeToVectorTransfer(const TransferEmitContext &c,
 // back through a convert_layout (NZ fractal -> ND view) for matmul consumption.
 // NZ packing applies only when both dims are multiples of 16; otherwise the L1
 // buffer keeps the flat [M, N] layout.
-static void emitVectorToCubeTransfer(const TransferEmitContext &c,
-                                     CrossScopeTransfer &xfer,
-                                     RankedTensorType tensorType,
-                                     int flagId,
-                                     BufferPool &bufferPool) {
+static VectorToCubeTransferChain
+emitVectorToCubeTransfer(const TransferEmitContext &c,
+                         CrossScopeTransfer &xfer,
+                         RankedTensorType tensorType, int flagId,
+                         BufferPool &bufferPool) {
   Type elemType = tensorType.getElementType();
   ArrayRef<int64_t> shape = tensorType.getShape();
 
@@ -326,6 +327,7 @@ static void emitVectorToCubeTransfer(const TransferEmitContext &c,
   builder.setInsertionPointAfter(xfer.producer);
   auto ubAddrSpace = builder.getAttr<hivm::AddressSpaceAttr>(hivm::AddressSpace::UB);
   Value packedTensor = xfer.value;
+  SmallVector<Operation *> packingOps;
   SmallVector<int64_t, 4> srcShape =
       useNZ ? SmallVector<int64_t, 4>{N16, M16, 16, 16}
             : SmallVector<int64_t, 4>{M, N};
@@ -340,12 +342,14 @@ static void emitVectorToCubeTransfer(const TransferEmitContext &c,
     auto resh1Type = RankedTensorType::get({M, N16, 16}, elemType);
     auto resh1 = builder.create<tensor::ReshapeOp>(c.loc, resh1Type,
         xfer.value, s3Const.getResult());
+    packingOps.push_back(resh1);
     setOpEngineTypeAttr(resh1, EngineType::VECTOR);
     auto emptyT = builder.create<tensor::EmptyOp>(c.loc,
         ArrayRef<int64_t>{N16, M, 16}, elemType);
     setOpEngineTypeAttr(emptyT, EngineType::VECTOR);
     auto transp = builder.create<linalg::TransposeOp>(c.loc, resh1.getResult(),
         emptyT.getResult(), ArrayRef<int64_t>{1, 0, 2});
+    packingOps.push_back(transp);
     setOpEngineTypeAttr(transp, EngineType::VECTOR);
     auto s4Type = RankedTensorType::get({4}, i64Ty);
     auto s4Const = builder.create<arith::ConstantOp>(c.loc, s4Type,
@@ -354,6 +358,7 @@ static void emitVectorToCubeTransfer(const TransferEmitContext &c,
     auto nzTensorType = RankedTensorType::get({N16, M16, 16, 16}, elemType);
     auto resh2 = builder.create<tensor::ReshapeOp>(c.loc, nzTensorType,
         transp->getResult(0), s4Const.getResult());
+    packingOps.push_back(resh2);
     setOpEngineTypeAttr(resh2, EngineType::VECTOR);
     packedTensor = resh2.getResult();
   }
@@ -361,16 +366,19 @@ static void emitVectorToCubeTransfer(const TransferEmitContext &c,
   auto srcMemrefType = MemRefType::get(srcShape, elemType);
   auto toMemrefOp = builder.create<bufferization::ToMemrefOp>(
       c.loc, srcMemrefType, packedTensor);
+  packingOps.push_back(toMemrefOp);
   setOpEngineTypeAttr(toMemrefOp, EngineType::VECTOR);
   auto ubMemrefType = MemRefType::get(srcShape, elemType, nullptr, ubAddrSpace);
   auto ubCastOp = builder.create<memref::MemorySpaceCastOp>(
       c.loc, ubMemrefType, toMemrefOp.getResult());
+  packingOps.push_back(ubCastOp);
   setOpEngineTypeAttr(ubCastOp, EngineType::VECTOR);
 
   // UB -> L1 copy (same NZ/flat shape on both sides).
   auto copyOp = builder.create<hivm::CopyOp>(c.loc, mlir::TypeRange{},
       ubCastOp.getResult(),           // src (UB memref)
       sharedL1AllocOp.getResult());   // dst (shared L1 memref)
+  packingOps.push_back(copyOp);
   setOpEngineTypeAttr(copyOp, EngineType::VECTOR);
 
   // VECTOR signals CUBE.
@@ -404,11 +412,14 @@ static void emitVectorToCubeTransfer(const TransferEmitContext &c,
   llvm::errs() << "[cv-split]   V→C transfer #" << flagId
                << ": " << xfer.producer->getName()
                << " → " << M << "x" << N << " L1 buffer\n";
+
+  return VectorToCubeTransferChain{xfer.value, sharedL1AllocOp.getResult(),
+                                   syncSetOp, std::move(packingOps)};
 }
 
 } // namespace
 
-LogicalResult insertCrossScopeTransfers(
+FailureOr<CrossScopeTransferInfo> insertCrossScopeTransfers(
     scf::ForOp loop,
     const DenseMap<Operation *, EngineType> &classification) {
 
@@ -418,8 +429,9 @@ LogicalResult insertCrossScopeTransfers(
 
   auto transfers = findCrossScopeValues(body, classification);
   if (transfers.empty()) {
-    llvm::errs() << "[cv-split] No cross-scope transfers needed\n";
-    return success();
+    loop.emitError() << "CVSplitScheduling requires at least one CUBE-to-VECTOR "
+                        "transfer to determine BLOCK_M";
+    return failure();
   }
 
   if (transfers.size() > kMaxTransferFlags) {
@@ -427,6 +439,39 @@ LogicalResult insertCrossScopeTransfers(
                      << " synchronization flags, but only "
                      << kMaxTransferFlags << " are available (IDs 0.."
                      << kMaxTransferFlagId << ")";
+    return failure();
+  }
+
+  // ROW_SPLIT is materialized by the C->V fixpipes below. Their source is the
+  // full CUBE result [BLOCK_M, ...], while their destination UB allocation is
+  // [BLOCK_M/2, ...]. Derive BLOCK_M from that semantic boundary and require
+  // every C->V transfer to agree before mutating the IR.
+  std::optional<int64_t> blockM;
+  for (const CrossScopeTransfer &xfer : transfers) {
+    if (xfer.direction != CrossScopeTransfer::CUBE_TO_VECTOR)
+      continue;
+
+    auto tensorType = dyn_cast<RankedTensorType>(xfer.value.getType());
+    if (!tensorType || tensorType.getRank() != 2 ||
+        tensorType.isDynamicDim(0)) {
+      loop.emitError() << "CVSplitScheduling requires each CUBE-to-VECTOR "
+                          "transfer to have a static rank-2 tensor type";
+      return failure();
+    }
+
+    int64_t candidateBlockM = tensorType.getDimSize(0);
+    if (blockM && *blockM != candidateBlockM) {
+      loop.emitError() << "CVSplitScheduling found inconsistent BLOCK_M "
+                       << "values across CUBE-to-VECTOR transfers: " << *blockM
+                       << " and " << candidateBlockM;
+      return failure();
+    }
+    blockM = candidateBlockM;
+  }
+
+  if (!blockM) {
+    loop.emitError() << "CVSplitScheduling requires at least one CUBE-to-VECTOR "
+                        "transfer to determine BLOCK_M";
     return failure();
   }
 
@@ -461,6 +506,7 @@ LogicalResult insertCrossScopeTransfers(
   // Depth-2 ping/pong pool shared by all transfers: same-typed buffers (all
   // unrolled qk_ub, all pv_ub, all P L1) rotate over 2 physical allocations.
   BufferPool bufferPool;
+  SmallVector<VectorToCubeTransferChain> vectorToCubeChains;
 
   for (auto &xfer : transfers) {
     auto tensorType = cast<RankedTensorType>(xfer.value.getType());
@@ -474,14 +520,14 @@ LogicalResult insertCrossScopeTransfers(
       emitCubeToVectorTransfer(ec, xfer, tensorType, nextSyncFlagId,
                                bufferPool);
     else
-      emitVectorToCubeTransfer(ec, xfer, tensorType, nextSyncFlagId,
-                               bufferPool);
+      vectorToCubeChains.push_back(emitVectorToCubeTransfer(
+          ec, xfer, tensorType, nextSyncFlagId, bufferPool));
     ++nextSyncFlagId;
   }
 
   llvm::errs() << "[cv-split] Inserted " << transfers.size()
                << " transfers with " << nextSyncFlagId << " sync flags\n";
-  return success();
+  return CrossScopeTransferInfo{*blockM, std::move(vectorToCubeChains)};
 }
 
 } // namespace mlir::triton::cv_split

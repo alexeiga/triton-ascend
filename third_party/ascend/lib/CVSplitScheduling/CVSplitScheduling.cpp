@@ -444,7 +444,9 @@ private:
 
     // Stage 8: Insert cross-scope transfers (BEFORE scope separation)
     llvm::errs() << "[cv-split] === Stage 8: cross-scope transfers ===\n";
-    if (failed(cv_split::insertCrossScopeTransfers(loop, classification))) {
+    FailureOr<cv_split::CrossScopeTransferInfo> transferInfo =
+        cv_split::insertCrossScopeTransfers(loop, classification);
+    if (failed(transferInfo)) {
       signalPassFailure();
       return;
     }
@@ -460,8 +462,8 @@ private:
 
     // Stage 9: Scope separation (like DynamicCVPipeline/SeparateCVScope)
     llvm::errs() << "[cv-split] === Stage 9: scope separation ===\n";
-    if (failed(cv_split::createScopeSeparation(funcOp, loop,
-                                               classification))) {
+    if (failed(cv_split::createScopeSeparation(funcOp, loop, classification,
+                                               *transferInfo))) {
       signalPassFailure();
       return;
     }
