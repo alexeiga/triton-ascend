@@ -1,0 +1,12 @@
+#ifndef TRITON_CONVERSION_TRITON_TO_LINALG_CVSPLITSCHEDULING_HARDWARECONSTANTS_H
+#define TRITON_CONVERSION_TRITON_TO_LINALG_CVSPLITSCHEDULING_HARDWARECONSTANTS_H
+
+#include <cstdint>
+
+namespace mlir::triton::cv_split {
+
+inline constexpr int64_t kNzTileSize = 16;
+
+} // namespace mlir::triton::cv_split
+
+#endif // TRITON_CONVERSION_TRITON_TO_LINALG_CVSPLITSCHEDULING_HARDWARECONSTANTS_H

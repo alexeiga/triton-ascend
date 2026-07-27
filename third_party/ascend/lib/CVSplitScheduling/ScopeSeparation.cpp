@@ -1,4 +1,5 @@
 #include "ascend/include/CVSplitScheduling/ScopeSeparation.h"
+#include "ascend/include/CVSplitScheduling/HardwareConstants.h"
 
 #include "bishengir/Dialect/Annotation/IR/Annotation.h"
 #include "bishengir/Dialect/HACC/IR/HACC.h"
@@ -773,30 +774,38 @@ static void rebuildVectorToCubePacks(ArrayRef<VectorToCubePack> packs,
     auto pType = cast<RankedTensorType>(p.pSrc.getType()); // 16x32xf16
     int64_t M = pType.getShape()[0];     // 16
     int64_t N = pType.getShape()[1];     // 32
-    int64_t N16 = N / 16, M16 = M / 16;  // 2, 1
+    int64_t N16 = N / kNzTileSize, M16 = M / kNzTileSize; // 2, 1
     Type elemType = pType.getElementType();
     OpBuilder b(p.anchor);
     auto i64Ty = b.getI64Type();
     // reshape [M,N] -> [M, N16, 16]
     auto s3Type = RankedTensorType::get({3}, i64Ty);
     auto s3 = b.create<arith::ConstantOp>(loc, s3Type,
-        DenseElementsAttr::get(s3Type, ArrayRef<int64_t>{M, N16, 16}));
-    auto resh1Type = RankedTensorType::get({M, N16, 16}, elemType);
+        DenseElementsAttr::get(
+            s3Type, ArrayRef<int64_t>{M, N16, kNzTileSize}));
+    auto resh1Type =
+        RankedTensorType::get({M, N16, kNzTileSize}, elemType);
     auto resh1 = b.create<tensor::ReshapeOp>(loc, resh1Type, p.pSrc, s3.getResult());
     // transpose [M,N16,16] -> [N16,M,16]
-    auto emptyT = b.create<tensor::EmptyOp>(loc, ArrayRef<int64_t>{N16, M, 16}, elemType);
+    auto emptyT = b.create<tensor::EmptyOp>(
+        loc, ArrayRef<int64_t>{N16, M, kNzTileSize}, elemType);
     auto transp = b.create<linalg::TransposeOp>(loc, resh1.getResult(),
         emptyT.getResult(), ArrayRef<int64_t>{1, 0, 2});
     // reshape [N16,M,16] -> [N16,M16,16,16]
     auto s4Type = RankedTensorType::get({4}, i64Ty);
     auto s4 = b.create<arith::ConstantOp>(loc, s4Type,
-        DenseElementsAttr::get(s4Type, ArrayRef<int64_t>{N16, M16, 16, 16}));
-    auto nzType = RankedTensorType::get({N16, M16, 16, 16}, elemType);
+        DenseElementsAttr::get(
+            s4Type,
+            ArrayRef<int64_t>{N16, M16, kNzTileSize, kNzTileSize}));
+    auto nzType = RankedTensorType::get(
+        {N16, M16, kNzTileSize, kNzTileSize}, elemType);
     auto resh2 = b.create<tensor::ReshapeOp>(loc, nzType, transp->getResult(0), s4.getResult());
     // to_memref + cast to UB
-    auto memT = MemRefType::get({N16, M16, 16, 16}, elemType);
+    auto memT = MemRefType::get(
+        {N16, M16, kNzTileSize, kNzTileSize}, elemType);
     auto toMem = b.create<bufferization::ToMemrefOp>(loc, memT, resh2.getResult());
-    auto ubMemT = MemRefType::get({N16, M16, 16, 16}, elemType, nullptr, ubAddrSpace);
+    auto ubMemT = MemRefType::get(
+        {N16, M16, kNzTileSize, kNzTileSize}, elemType, nullptr, ubAddrSpace);
     auto cast = b.create<memref::MemorySpaceCastOp>(loc, ubMemT, toMem.getResult());
     // subview of L1 alloc [0, sbid*M16, 0, 0] [N16,M16,16,16]: each veccore owns
     // M16 = (rows/veccore)/16 fractal-row blocks, so veccore `sbid` writes the
@@ -807,7 +816,8 @@ static void rebuildVectorToCubePacks(ArrayRef<VectorToCubePack> packs,
     SmallVector<OpFoldResult, 4> offs{b.getIndexAttr(0), off1,
                                       b.getIndexAttr(0), b.getIndexAttr(0)};
     SmallVector<OpFoldResult, 4> szs{b.getIndexAttr(N16), b.getIndexAttr(M16),
-                                     b.getIndexAttr(16), b.getIndexAttr(16)};
+                                     b.getIndexAttr(kNzTileSize),
+                                     b.getIndexAttr(kNzTileSize)};
     SmallVector<OpFoldResult, 4> strs{b.getIndexAttr(1), b.getIndexAttr(1),
                                       b.getIndexAttr(1), b.getIndexAttr(1)};
     auto subview = b.create<memref::SubViewOp>(loc, p.l1Alloc, offs, szs, strs);

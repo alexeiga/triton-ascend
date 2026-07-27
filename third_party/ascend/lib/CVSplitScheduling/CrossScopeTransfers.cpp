@@ -1,4 +1,5 @@
 #include "ascend/include/CVSplitScheduling/CrossScopeTransfers.h"
+#include "ascend/include/CVSplitScheduling/HardwareConstants.h"
 #include "ascend/include/CVSplitScheduling/UnrollOrigin.h"
 
 #include "bishengir/Dialect/Annotation/IR/Annotation.h"
@@ -310,10 +311,11 @@ emitVectorToCubeTransfer(const TransferEmitContext &c,
 
   // NZ-fractal L1 layout: ND [M, N] is stored as [N/16, M/16, 16, 16] (B16
   // fractal) when both dims are multiples of 16; otherwise fall back to flat.
-  bool useNZ = (M % 16 == 0) && (N % 16 == 0);
-  int64_t N16 = N / 16, M16 = M / 16;
+  bool useNZ =
+      (M % kNzTileSize == 0) && (N % kNzTileSize == 0);
+  int64_t N16 = N / kNzTileSize, M16 = M / kNzTileSize;
   SmallVector<int64_t, 4> l1Shape =
-      useNZ ? SmallVector<int64_t, 4>{N16, M16, 16, 16}
+      useNZ ? SmallVector<int64_t, 4>{N16, M16, kNzTileSize, kNzTileSize}
             : SmallVector<int64_t, 4>{M, N};
   auto l1AllocType = MemRefType::get(l1Shape, elemType, nullptr, l1AddrSpace);
 
@@ -329,7 +331,7 @@ emitVectorToCubeTransfer(const TransferEmitContext &c,
   Value packedTensor = xfer.value;
   SmallVector<Operation *> packingOps;
   SmallVector<int64_t, 4> srcShape =
-      useNZ ? SmallVector<int64_t, 4>{N16, M16, 16, 16}
+      useNZ ? SmallVector<int64_t, 4>{N16, M16, kNzTileSize, kNzTileSize}
             : SmallVector<int64_t, 4>{M, N};
 
   if (useNZ) {
@@ -337,15 +339,17 @@ emitVectorToCubeTransfer(const TransferEmitContext &c,
     auto i64Ty = builder.getI64Type();
     auto s3Type = RankedTensorType::get({3}, i64Ty);
     auto s3Const = builder.create<arith::ConstantOp>(c.loc, s3Type,
-        DenseElementsAttr::get(s3Type, ArrayRef<int64_t>{M, N16, 16}));
+        DenseElementsAttr::get(
+            s3Type, ArrayRef<int64_t>{M, N16, kNzTileSize}));
     setOpEngineTypeAttr(s3Const, EngineType::VECTOR);
-    auto resh1Type = RankedTensorType::get({M, N16, 16}, elemType);
+    auto resh1Type =
+        RankedTensorType::get({M, N16, kNzTileSize}, elemType);
     auto resh1 = builder.create<tensor::ReshapeOp>(c.loc, resh1Type,
         xfer.value, s3Const.getResult());
     packingOps.push_back(resh1);
     setOpEngineTypeAttr(resh1, EngineType::VECTOR);
     auto emptyT = builder.create<tensor::EmptyOp>(c.loc,
-        ArrayRef<int64_t>{N16, M, 16}, elemType);
+        ArrayRef<int64_t>{N16, M, kNzTileSize}, elemType);
     setOpEngineTypeAttr(emptyT, EngineType::VECTOR);
     auto transp = builder.create<linalg::TransposeOp>(c.loc, resh1.getResult(),
         emptyT.getResult(), ArrayRef<int64_t>{1, 0, 2});
@@ -353,9 +357,12 @@ emitVectorToCubeTransfer(const TransferEmitContext &c,
     setOpEngineTypeAttr(transp, EngineType::VECTOR);
     auto s4Type = RankedTensorType::get({4}, i64Ty);
     auto s4Const = builder.create<arith::ConstantOp>(c.loc, s4Type,
-        DenseElementsAttr::get(s4Type, ArrayRef<int64_t>{N16, M16, 16, 16}));
+        DenseElementsAttr::get(
+            s4Type,
+            ArrayRef<int64_t>{N16, M16, kNzTileSize, kNzTileSize}));
     setOpEngineTypeAttr(s4Const, EngineType::VECTOR);
-    auto nzTensorType = RankedTensorType::get({N16, M16, 16, 16}, elemType);
+    auto nzTensorType = RankedTensorType::get(
+        {N16, M16, kNzTileSize, kNzTileSize}, elemType);
     auto resh2 = builder.create<tensor::ReshapeOp>(c.loc, nzTensorType,
         transp->getResult(0), s4Const.getResult());
     packingOps.push_back(resh2);

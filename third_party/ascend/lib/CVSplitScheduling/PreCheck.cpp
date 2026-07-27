@@ -1,4 +1,5 @@
 #include "ascend/include/CVSplitScheduling/PreCheck.h"
+#include "ascend/include/CVSplitScheduling/HardwareConstants.h"
 
 #include "mlir/Dialect/Bufferization/IR/Bufferization.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -15,6 +16,7 @@
 #define DEBUG_TYPE "cv-split-pre-check"
 
 using namespace mlir;
+using mlir::triton::cv_split::kNzTileSize;
 namespace {
 
 static SmallVector<scf::ForOp> collectInnermostLoops(func::FuncOp funcOp) {
@@ -112,7 +114,7 @@ static LogicalResult checkMatmulDimensionsAre16Aligned(scf::ForOp forOp) {
     if (!tensorType || tensorType.getRank() != 2)
       return false;
     for (int64_t dim : tensorType.getShape())
-      if (dim <= 0 || dim % 16 != 0)
+      if (dim <= 0 || dim % kNzTileSize != 0)
         return false;
     return true;
   };
@@ -143,7 +145,8 @@ static LogicalResult checkMatmulRowsAre32Aligned(scf::ForOp forOp) {
 
     auto resultType = dyn_cast<RankedTensorType>(matmulOp.getResult(0).getType());
     if (!resultType || resultType.getRank() != 2 ||
-        resultType.getShape()[0] <= 0 || resultType.getShape()[0] % 32 != 0)
+        resultType.getShape()[0] <= 0 ||
+        resultType.getShape()[0] % (2 * kNzTileSize) != 0)
       return failure();
   }
   return success();
