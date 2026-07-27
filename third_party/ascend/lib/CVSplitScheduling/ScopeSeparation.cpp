@@ -708,12 +708,14 @@ static LogicalResult retileVectorScopeOps(scope::ScopeOp vecScope,
 // Step 5: shift each output store to this veccore's BLOCK_M/2-row band —
 // offset += sub_block_idx * (BLOCK_M/2) * leadingStride, size M = BLOCK_M/2.
 // Returns the store count.
-static unsigned retileOutputStores(scope::ScopeOp vecScope, Value sbidx,
-                                   Location loc, int64_t Mfull) {
+static FailureOr<unsigned> retileOutputStores(scope::ScopeOp vecScope,
+                                              Value sbidx, Location loc,
+                                              int64_t Mfull) {
   int64_t half = Mfull / 2;
   // ---- 5. Output stores: offset += sbid*half*leadingStride, sizes M=half ----
   SmallVector<bufferization::MaterializeInDestinationOp> mats;
   vecScope.walk([&](bufferization::MaterializeInDestinationOp m) { mats.push_back(m); });
+  unsigned retiledCount = 0;
   for (auto m : mats) {
     auto ric = m.getDest().getDefiningOp<memref::ReinterpretCastOp>();
     if (!ric) continue;
@@ -725,23 +727,37 @@ static unsigned retileOutputStores(scope::ScopeOp vecScope, Value sbidx,
     auto offsets = ric.getMixedOffsets();
     auto sizes = ric.getMixedSizes();
     auto strides = ric.getMixedStrides();
-    int64_t leadStride = 1;
-    if (auto sAttr = dyn_cast<Attribute>(strides[0]))
-      leadStride = cast<IntegerAttr>(sAttr).getInt();
+    if (offsets.empty() || sizes.empty() || strides.empty()) {
+      ric.emitError("expected offset, size, and stride metadata for dimension "
+                    "0");
+      return failure();
+    }
+    Value leadStride =
+        getValueOrCreateConstantIndexOp(b, loc, strides[0]);
     Value origOff = getValueOrCreateConstantIndexOp(b, loc, offsets[0]);
-    Value step = b.create<arith::ConstantIndexOp>(loc, half * leadStride);
+    Value halfValue = b.create<arith::ConstantIndexOp>(loc, half);
+    Value step = b.create<arith::MulIOp>(loc, halfValue, leadStride);
     Value add = b.create<arith::MulIOp>(loc, sbidx, step);
     Value newOff = b.create<arith::AddIOp>(loc, origOff, add);
     sizes[0] = b.getIndexAttr(half);
-    // FIXME: return FailureOr<unsigned> and fail before mutation when the
-    // output memref does not retile from BLOCK_M to BLOCK_M/2.
-    auto newType = cast<MemRefType>(retileRowHalve(ric.getType(), Mfull));
+    MemRefType oldType = ric.getType();
+    if (oldType.getRank() < 1 || oldType.getDimSize(0) != Mfull) {
+      ric.emitError("expected output leading dimension to equal BLOCK_M");
+      return failure();
+    }
+    auto newType = cast<MemRefType>(retileRowHalve(oldType, Mfull));
+    if (newType == oldType || newType.getDimSize(0) != half) {
+      ric.emitError("failed to retile output from BLOCK_M to BLOCK_M/2");
+      return failure();
+    }
     auto newRic = b.create<memref::ReinterpretCastOp>(
         loc, newType, ric.getSource(), getAsOpFoldResult(newOff), sizes, strides);
-    ric.replaceAllUsesWith(newRic.getResult());
-    ric.erase();
+    m.getDestMutable().set(newRic.getResult());
+    if (ric->use_empty())
+      ric.erase();
+    ++retiledCount;
   }
-  return mats.size();
+  return retiledCount;
 }
 
 // Step 6: rebuild each detached V->C pack as a per-veccore pack: 16x32 ->
@@ -817,12 +833,15 @@ retileVectorScopeForRowSplit(scope::ScopeOp vecScope,
   unsigned clonedCount = cloneExternalInitsAsHalfHeight(vecScope, loc, blockM);
   if (failed(retileVectorScopeOps(vecScope, blockM)))
     return failure();
-  unsigned nStores = retileOutputStores(vecScope, sbidx, loc, blockM);
+  FailureOr<unsigned> nStores =
+      retileOutputStores(vecScope, sbidx, loc, blockM);
+  if (failed(nStores))
+    return failure();
   rebuildVectorToCubePacks(packs, sbidx, ubAddrSpace, loc);
 
   llvm::errs() << "[cv-split]   ROW_SPLIT re-tile (BLOCK_M=" << blockM << " -> "
                << (blockM / 2) << "/veccore): " << packs.size()
-               << " V->C packs, " << nStores << " stores, "
+               << " V->C packs, " << *nStores << " stores, "
                << clonedCount << " ext consts cloned\n";
   return success();
 }
