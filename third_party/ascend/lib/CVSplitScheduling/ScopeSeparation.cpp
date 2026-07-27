@@ -18,6 +18,7 @@
 #include "mlir/IR/IRMapping.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Interfaces/DestinationStyleOpInterface.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/MapVector.h"
@@ -572,6 +573,8 @@ static unsigned cloneExternalInitsAsHalfHeight(scope::ScopeOp vecScope,
   vecScope.walk([&](Operation *o) { vecOps.insert(o); });
   OpBuilder cb(vecScope);
   DenseMap<Value, Value> cloneMap;
+  DenseSet<Operation *> originalFills;
+  DenseSet<Operation *> originalEmpties;
   unsigned clonedCount = 0;
   vecScope.walk([&](Operation *op) {
     for (OpOperand &opd : op->getOpOperands()) {
@@ -594,11 +597,16 @@ static unsigned cloneExternalInitsAsHalfHeight(scope::ScopeOp vecScope,
         assert(ntt == expectedType &&
                "retile must only halve the BLOCK_M dimension");
         if (auto fill = dyn_cast<linalg::FillOp>(d)) {
+          originalFills.insert(d);
+          Value init = fill.getDpsInitOperand(0)->get();
+          if (auto empty = init.getDefiningOp<tensor::EmptyOp>())
+            originalEmpties.insert(empty);
           Value ne = cb.create<tensor::EmptyOp>(
               loc, ntt.getShape(), ntt.getElementType(), ntt.getEncoding());
           repl = cb.create<linalg::FillOp>(loc, fill.getInputs(),
                                            ValueRange{ne}).getResult(0);
         } else if (isa<tensor::EmptyOp>(d)) {
+          originalEmpties.insert(d);
           repl = cb.create<tensor::EmptyOp>(
               loc, ntt.getShape(), ntt.getElementType(), ntt.getEncoding());
         } else {
@@ -610,10 +618,23 @@ static unsigned cloneExternalInitsAsHalfHeight(scope::ScopeOp vecScope,
       opd.set(repl);
     }
   });
-  // FIXME: The original tensor.empty/linalg.fill initializers can become dead
-  // after all VECTOR uses are redirected. Downstream canonicalization is
-  // expected to erase them; add targeted cleanup here if that is not guaranteed
-  // by every pipeline that runs this pass.
+
+  // Erase fills before their backing empties so each empty can become dead
+  // before it is checked.
+  unsigned removedCount = 0;
+  for (Operation *fill : originalFills)
+    if (isOpTriviallyDead(fill)) {
+      fill->erase();
+      ++removedCount;
+    }
+  for (Operation *empty : originalEmpties)
+    if (isOpTriviallyDead(empty)) {
+      empty->erase();
+      ++removedCount;
+    }
+  llvm::errs() << "[cv-split]   Removed " << removedCount
+               << " dead original initializer(s)\n";
+
   return clonedCount;
 }
 
