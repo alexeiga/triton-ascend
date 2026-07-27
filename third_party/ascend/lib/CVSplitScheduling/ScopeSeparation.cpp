@@ -764,21 +764,41 @@ static FailureOr<unsigned> retileOutputStores(scope::ScopeOp vecScope,
 // Step 6: rebuild each detached V->C pack as a per-veccore pack: 16x32 ->
 // 2x1x16x16, copied into this veccore's subview [0, sub_block_idx, 0, 0] of the
 // shared L1 buffer.
-static void rebuildVectorToCubePacks(ArrayRef<VectorToCubePack> packs,
-                                     Value sbidx,
-                                     hivm::AddressSpaceAttr ubAddrSpace,
-                                     Location loc) {
+static LogicalResult
+rebuildVectorToCubePacks(ArrayRef<VectorToCubePack> packs, Value sbidx,
+                         hivm::AddressSpaceAttr ubAddrSpace, Location loc) {
   // ---- 6. Regenerate V->C packs: 16x32 -> 2x1x16x16 -> subview[0,sbid,0,0] ----
   for (auto &p : packs) {
-    if (!p.pSrc) continue;
-    auto pType = cast<RankedTensorType>(p.pSrc.getType()); // 16x32xf16
-    int64_t M = pType.getShape()[0];     // 16
-    int64_t N = pType.getShape()[1];     // 32
-    int64_t N16 = N / kNzTileSize, M16 = M / kNzTileSize; // 2, 1
+    if (!p.pSrc) {
+      emitError(loc, "V->C pack must have a source tensor");
+      return failure();
+    }
+    if (!p.anchor || !isa<hivm::SyncBlockSetOp>(p.anchor)) {
+      emitError(loc, "V->C pack must have a sync_block_set anchor");
+      return failure();
+    }
+    auto pType = dyn_cast<RankedTensorType>(p.pSrc.getType());
+    if (!pType || pType.getRank() != 2 || !pType.hasStaticShape()) {
+      emitError(loc, "V->C pack source must be a static rank-2 tensor");
+      return failure();
+    }
+    int64_t M = pType.getShape()[0];
+    int64_t N = pType.getShape()[1];
+    int64_t N16 = N / kNzTileSize, M16 = M / kNzTileSize;
     Type elemType = pType.getElementType();
     OpBuilder b(p.anchor);
+    auto l1AddrSpace =
+        b.getAttr<hivm::AddressSpaceAttr>(hivm::AddressSpace::L1);
+    auto expectedL1Type = MemRefType::get(
+        {N16, 2 * M16, kNzTileSize, kNzTileSize}, elemType, nullptr,
+        l1AddrSpace);
+    if (!p.l1Alloc || p.l1Alloc.getType() != expectedL1Type) {
+      emitError(loc) << "V->C pack L1 destination must have type "
+                     << expectedL1Type;
+      return failure();
+    }
     auto i64Ty = b.getI64Type();
-    // reshape [M,N] -> [M, N16, 16]
+    // reshape [M,N] -> [M, N16, kNzTileSize]
     auto s3Type = RankedTensorType::get({3}, i64Ty);
     auto s3 = b.create<arith::ConstantOp>(loc, s3Type,
         DenseElementsAttr::get(
@@ -786,12 +806,12 @@ static void rebuildVectorToCubePacks(ArrayRef<VectorToCubePack> packs,
     auto resh1Type =
         RankedTensorType::get({M, N16, kNzTileSize}, elemType);
     auto resh1 = b.create<tensor::ReshapeOp>(loc, resh1Type, p.pSrc, s3.getResult());
-    // transpose [M,N16,16] -> [N16,M,16]
+    // transpose [M,N16,kNzTileSize] -> [N16,M,kNzTileSize]
     auto emptyT = b.create<tensor::EmptyOp>(
         loc, ArrayRef<int64_t>{N16, M, kNzTileSize}, elemType);
     auto transp = b.create<linalg::TransposeOp>(loc, resh1.getResult(),
         emptyT.getResult(), ArrayRef<int64_t>{1, 0, 2});
-    // reshape [N16,M,16] -> [N16,M16,16,16]
+    // reshape [N16,M,kNzTileSize] -> [N16,M16,kNzTileSize,kNzTileSize]
     auto s4Type = RankedTensorType::get({4}, i64Ty);
     auto s4 = b.create<arith::ConstantOp>(loc, s4Type,
         DenseElementsAttr::get(
@@ -823,6 +843,7 @@ static void rebuildVectorToCubePacks(ArrayRef<VectorToCubePack> packs,
     auto subview = b.create<memref::SubViewOp>(loc, p.l1Alloc, offs, szs, strs);
     b.create<hivm::CopyOp>(loc, mlir::TypeRange{}, cast.getResult(), subview.getResult());
   }
+  return success();
 }
 
 // Re-tile the VECTOR scope for ROW_SPLIT so both veccores do useful work (2x
@@ -847,7 +868,8 @@ retileVectorScopeForRowSplit(scope::ScopeOp vecScope,
       retileOutputStores(vecScope, sbidx, loc, blockM);
   if (failed(nStores))
     return failure();
-  rebuildVectorToCubePacks(packs, sbidx, ubAddrSpace, loc);
+  if (failed(rebuildVectorToCubePacks(packs, sbidx, ubAddrSpace, loc)))
+    return failure();
 
   llvm::errs() << "[cv-split]   ROW_SPLIT re-tile (BLOCK_M=" << blockM << " -> "
                << (blockM / 2) << "/veccore): " << packs.size()
