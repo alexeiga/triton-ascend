@@ -15,7 +15,6 @@
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/raw_ostream.h"
 
-#include <cassert>
 #include <optional>
 
 namespace mlir::triton::cv_split {
@@ -39,16 +38,21 @@ struct CrossScopeTransfer {
   Operation *producer;
   SmallVector<Operation *> consumers;
   enum Direction { CUBE_TO_VECTOR, VECTOR_TO_CUBE } direction;
+  int64_t originId;
 };
 
-static int64_t getUnrollOriginId(const CrossScopeTransfer &xfer) {
-  auto originAttr = xfer.producer->getAttrOfType<IntegerAttr>(
+static FailureOr<int64_t> getUnrollOriginId(Operation *producer) {
+  auto originAttr = producer->getAttrOfType<IntegerAttr>(
       kUnrollOriginIdAttrName);
-  assert(originAttr && "transfer producer must have an unroll origin ID");
+  if (!originAttr) {
+    producer->emitError("cross-scope transfer producer is missing its "
+                        "unroll-origin ID");
+    return failure();
+  }
   return originAttr.getInt();
 }
 
-static SmallVector<CrossScopeTransfer> findCrossScopeValues(
+static FailureOr<SmallVector<CrossScopeTransfer>> findCrossScopeValues(
     Block *body,
     const DenseMap<Operation *, EngineType> &classification) {
   SmallVector<CrossScopeTransfer> transfers;
@@ -57,8 +61,10 @@ static SmallVector<CrossScopeTransfer> findCrossScopeValues(
     if (isa<scf::YieldOp>(&op))
       continue;
     auto prodIt = classification.find(&op);
-    assert(prodIt != classification.end() &&
-           "body operation must have a classification");
+    if (prodIt == classification.end()) {
+      op.emitError("body operation is missing a core classification");
+      return failure();
+    }
     EngineType prodType = prodIt->second;
 
     // C→V: Only transfer results of linalg.matmul (QK and PV dot products)
@@ -73,21 +79,29 @@ static SmallVector<CrossScopeTransfer> findCrossScopeValues(
     if (prodType == EngineType::CUBE && isa<linalg::MatmulOp>(&op)) {
       // C→V: matmul result consumed by VECTOR ops
       for (Value result : op.getResults()) {
-        assert(isa<RankedTensorType>(result.getType()) &&
-               "tensor-semantics matmul must produce a ranked tensor");
+        if (!isa<RankedTensorType>(result.getType())) {
+          op.emitError("CUBE-to-VECTOR matmul result must be a ranked tensor");
+          return failure();
+        }
         SmallVector<Operation *> crossUsers;
         for (Operation *user : result.getUsers()) {
           if (user->getBlock() != body || isa<scf::YieldOp>(user))
             continue;
           auto consIt = classification.find(user);
-          assert(consIt != classification.end() &&
-                 "body operation must have a classification");
+          if (consIt == classification.end()) {
+            user->emitError("body operation is missing a core classification");
+            return failure();
+          }
           if (consIt->second == EngineType::VECTOR)
             crossUsers.push_back(user);
         }
-        if (!crossUsers.empty())
+        if (!crossUsers.empty()) {
+          FailureOr<int64_t> originId = getUnrollOriginId(&op);
+          if (failed(originId))
+            return failure();
           transfers.push_back({result, &op, crossUsers,
-                               CrossScopeTransfer::CUBE_TO_VECTOR});
+                               CrossScopeTransfer::CUBE_TO_VECTOR, *originId});
+        }
       }
     } else if (prodType == EngineType::VECTOR) {
       // V→C: transfer VECTOR results that feed matmul input operands.
@@ -101,14 +115,20 @@ static SmallVector<CrossScopeTransfer> findCrossScopeValues(
             continue;
           bool feedsMatmulInput = user->getOperand(0) == result ||
                                   user->getOperand(1) == result;
-          assert(feedsMatmulInput &&
-                 "VECTOR-produced matmul accumulator should have been "
-                 "unfused");
+          if (!feedsMatmulInput) {
+            user->emitError("VECTOR-produced matmul accumulator was not "
+                            "successfully unfused");
+            return failure();
+          }
           crossUsers.push_back(user);
         }
-        if (!crossUsers.empty())
+        if (!crossUsers.empty()) {
+          FailureOr<int64_t> originId = getUnrollOriginId(&op);
+          if (failed(originId))
+            return failure();
           transfers.push_back({result, &op, crossUsers,
-                               CrossScopeTransfer::VECTOR_TO_CUBE});
+                               CrossScopeTransfer::VECTOR_TO_CUBE, *originId});
+        }
       }
     }
   }
@@ -243,7 +263,7 @@ static void emitCubeToVectorTransfer(const TransferEmitContext &c,
   // clones of this original transfer operation).
   builder.setInsertionPoint(c.loop);
   auto sharedAllocOp = bufferPool.getOrCreate(
-      builder, c.loc, getUnrollOriginId(xfer), allocType);
+      builder, c.loc, xfer.originId, allocType);
 
   // fixpipe after the producer (inside loop body) -> writes the shared buffer.
   builder.setInsertionPointAfter(xfer.producer);
@@ -323,7 +343,7 @@ emitVectorToCubeTransfer(const TransferEmitContext &c,
   // clones of this original transfer operation).
   builder.setInsertionPoint(c.loop);
   auto sharedL1AllocOp = bufferPool.getOrCreate(
-      builder, c.loc, getUnrollOriginId(xfer), l1AllocType);
+      builder, c.loc, xfer.originId, l1AllocType);
 
   // Inside loop body after producer: (NZ pack) -> to_memref -> cast -> copy.
   builder.setInsertionPointAfter(xfer.producer);
@@ -434,7 +454,11 @@ FailureOr<CrossScopeTransferInfo> insertCrossScopeTransfers(
   Location loc = loop.getLoc();
   Block *body = loop.getBody();
 
-  auto transfers = findCrossScopeValues(body, classification);
+  FailureOr<SmallVector<CrossScopeTransfer>> transferResult =
+      findCrossScopeValues(body, classification);
+  if (failed(transferResult))
+    return failure();
+  SmallVector<CrossScopeTransfer> transfers = std::move(*transferResult);
   if (transfers.empty()) {
     loop.emitError() << "CVSplitScheduling requires at least one CUBE-to-VECTOR "
                         "transfer to determine BLOCK_M";
@@ -517,11 +541,10 @@ FailureOr<CrossScopeTransferInfo> insertCrossScopeTransfers(
 
   for (auto &xfer : transfers) {
     auto tensorType = cast<RankedTensorType>(xfer.value.getType());
-    // Transfer lowering handles rank-2 matmul tiles. In particular, V->C
-    // assumes an ND [M, N] tensor when constructing its NZ
-    // [N/16, M/16, 16, 16] L1 layout.
-    assert(tensorType.getRank() == 2 &&
-           "cross-scope transfers require rank-2 tensors");
+    if (tensorType.getRank() != 2) {
+      loop.emitError("cross-scope transfers require rank-2 tensors");
+      return failure();
+    }
 
     if (xfer.direction == CrossScopeTransfer::CUBE_TO_VECTOR)
       emitCubeToVectorTransfer(ec, xfer, tensorType, nextSyncFlagId,

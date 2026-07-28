@@ -10,6 +10,7 @@ FA_TEST="$REPO/third_party/ascend/unittest/Conversion/General/CVSplitScheduling/
 SCOPE_HOISTING_TEST="$REPO/third_party/ascend/unittest/Conversion/General/CVSplitScheduling/cv_split_scope_hoisting.mlir"
 ROLLBACK_TEST="$REPO/third_party/ascend/unittest/Conversion/General/CVSplitScheduling/cv_split_transaction_rollback.mlir"
 CANDIDATE_FALLBACK_TEST="$REPO/third_party/ascend/unittest/Conversion/General/CVSplitScheduling/cv_split_candidate_fallback.mlir"
+NESTED_CANDIDATE_TEST="$REPO/third_party/ascend/unittest/Conversion/General/CVSplitScheduling/cv_split_nested_candidate.mlir"
 VERBOSE=false
 
 case "${1:-}" in
@@ -234,6 +235,11 @@ if ! "$FC" "$CANDIDATE_FALLBACK_TEST" --check-prefix=DIAG \
 fi
 show_log_if_verbose "$CANDIDATE_FALLBACK_LOG"
 echo "    PASS: skipped a failed candidate and committed the next candidate"
+
+echo ">>> CVSplit nested candidate lit test"
+run_stdout_filecheck "$NESTED_CANDIDATE_TEST" 4 \
+  "$TMP_DIR/nested-candidate.log"
+echo "    PASS: transformed the single innermost loop inside an outer loop"
 
 echo ">>> CVSplit full Flash Attention lit test"
 run_stdout_filecheck "$FA_TEST" 4 "$TMP_DIR/fa.log"
