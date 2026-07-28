@@ -8,6 +8,8 @@ SINGLE_CORE_TEST="$REPO/third_party/ascend/unittest/Conversion/General/CVSplitSc
 MIXED_CORE_TEST="$REPO/third_party/ascend/unittest/Conversion/General/CVSplitScheduling/cv_split_classification_mixed_core.mlir"
 FA_TEST="$REPO/third_party/ascend/unittest/Conversion/General/CVSplitScheduling/cv_split_scheduling_fa.mlir"
 SCOPE_HOISTING_TEST="$REPO/third_party/ascend/unittest/Conversion/General/CVSplitScheduling/cv_split_scope_hoisting.mlir"
+ROLLBACK_TEST="$REPO/third_party/ascend/unittest/Conversion/General/CVSplitScheduling/cv_split_transaction_rollback.mlir"
+CANDIDATE_FALLBACK_TEST="$REPO/third_party/ascend/unittest/Conversion/General/CVSplitScheduling/cv_split_candidate_fallback.mlir"
 VERBOSE=false
 
 case "${1:-}" in
@@ -193,6 +195,45 @@ for classification_test in "$SINGLE_CORE_TEST" "$MIXED_CORE_TEST"; do
 done
 echo "    PASS: rejected single-core loops"
 echo "    PASS: accepted mixed-core loop"
+
+echo ">>> CVSplit transactional rollback lit test"
+run_stdout_filecheck "$ROLLBACK_TEST" 4 "$TMP_DIR/rollback-ir.log" \
+  --check-prefix=IR
+ROLLBACK_LOG="$TMP_DIR/rollback-diag.log"
+if ! "$OPT" "$ROLLBACK_TEST" \
+    "--cv_split_scheduling=compile-on-910-95=true unroll-factor=4" \
+    >/dev/null 2>"$ROLLBACK_LOG"; then
+  echo "    triton-opt diagnostics:" >&2
+  filter_ir_dumps <"$ROLLBACK_LOG" >&2
+  exit 1
+fi
+if ! "$FC" "$ROLLBACK_TEST" --check-prefix=DIAG <"$ROLLBACK_LOG"; then
+  echo "    triton-opt diagnostics:" >&2
+  filter_ir_dumps <"$ROLLBACK_LOG" >&2
+  exit 1
+fi
+show_log_if_verbose "$ROLLBACK_LOG"
+echo "    PASS: restored original IR after a late Stage-8 failure"
+
+echo ">>> CVSplit per-candidate fallback lit test"
+run_stdout_filecheck "$CANDIDATE_FALLBACK_TEST" 4 \
+  "$TMP_DIR/candidate-fallback-ir.log" --check-prefix=IR
+CANDIDATE_FALLBACK_LOG="$TMP_DIR/candidate-fallback-diag.log"
+if ! "$OPT" "$CANDIDATE_FALLBACK_TEST" \
+    "--cv_split_scheduling=compile-on-910-95=true unroll-factor=4" \
+    >/dev/null 2>"$CANDIDATE_FALLBACK_LOG"; then
+  echo "    triton-opt diagnostics:" >&2
+  filter_ir_dumps <"$CANDIDATE_FALLBACK_LOG" >&2
+  exit 1
+fi
+if ! "$FC" "$CANDIDATE_FALLBACK_TEST" --check-prefix=DIAG \
+    <"$CANDIDATE_FALLBACK_LOG"; then
+  echo "    triton-opt diagnostics:" >&2
+  filter_ir_dumps <"$CANDIDATE_FALLBACK_LOG" >&2
+  exit 1
+fi
+show_log_if_verbose "$CANDIDATE_FALLBACK_LOG"
+echo "    PASS: skipped a failed candidate and committed the next candidate"
 
 echo ">>> CVSplit full Flash Attention lit test"
 run_stdout_filecheck "$FA_TEST" 4 "$TMP_DIR/fa.log"

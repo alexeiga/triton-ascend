@@ -45,8 +45,7 @@ static void dumpClassifierIR(ModuleOp module, StringRef fileName) {
   output << '\n';
 }
 
-FailureOr<Classification> classifyAllOpsWithDCVP(ModuleOp module,
-                                                 Block *body) {
+LogicalResult runDCVPClassifier(ModuleOp module) {
   PassManager pm(module.getContext(), module.getOperationName());
   pm.addPass(createOpClassifierPass());
 
@@ -54,7 +53,10 @@ FailureOr<Classification> classifyAllOpsWithDCVP(ModuleOp module,
   if (failed(pm.run(module)))
     return failure();
   dumpClassifierIR(module, "after_dcvp_op_classifier.mlir");
+  return success();
+}
 
+FailureOr<Classification> readDCVPClassification(Block *body) {
   Classification classification;
   for (Operation &op : *body) {
     if (isa<scf::YieldOp>(op))

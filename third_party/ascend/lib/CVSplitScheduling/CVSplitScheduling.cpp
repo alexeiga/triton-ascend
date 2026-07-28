@@ -23,6 +23,7 @@
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/IR/PatternMatch.h"
+#include "mlir/IR/Verifier.h"
 #include "bishengir/Dialect/HIVM/IR/HIVM.h"
 #include "bishengir/Dialect/Scope/IR/Scope.h"
 #include "bishengir/Dialect/Annotation/IR/Annotation.h"
@@ -157,7 +158,7 @@ static void removeUnrollOriginIdAttrs(Operation *root) {
 // We target only the loop-invariant LHS (defined OUTSIDE the innermost loop):
 // that is Q for QK. The PV matmul LHS (P) is loop-variant (produced by the
 // vector scope) and already lives in cbuf via convert_layout, so it is skipped.
-static void bindLoopInvariantMatmulLhsToCbuf(func::FuncOp funcOp) {
+static LogicalResult bindLoopInvariantMatmulLhsToCbuf(func::FuncOp funcOp) {
   // Map each distinct loop-invariant LHS value to the CUBE scope that consumes
   // it. The alloc + bind must live INSIDE that scope (before its loop) so the
   // whole Q-staging is self-contained on the cube/AIC side after the MIX split
@@ -222,8 +223,11 @@ static void bindLoopInvariantMatmulLhsToCbuf(func::FuncOp funcOp) {
         }
       }
     }
-    if (!srcMemref)
-      continue; // unexpected producer; leave Q as-is (safe fallback)
+    if (!srcMemref) {
+      funcOp.emitError("failed to find the GM source for a loop-invariant "
+                       "matmul LHS");
+      return failure();
+    }
 
     OpBuilder builder(cubeScope.getContext());
     Location loc = q.getLoc();
@@ -334,6 +338,53 @@ static void bindLoopInvariantMatmulLhsToCbuf(func::FuncOp funcOp) {
     llvm::errs() << "[cv-split] Staged loop-invariant matmul LHS into cbuf "
                  << tt << " (inside CUBE scope, bind_buffer)\n";
   }
+
+  return success();
+}
+
+static void commitModuleClone(ModuleOp destination, ModuleOp source) {
+  Operation *destinationOp = destination.getOperation();
+  Operation *sourceOp = source.getOperation();
+
+  destinationOp->setLoc(sourceOp->getLoc());
+  destinationOp->setAttrs(sourceOp->getAttrs());
+  if (destinationOp->getPropertiesStorageSize() != 0)
+    destinationOp->copyProperties(sourceOp->getPropertiesStorage());
+  destination.getBodyRegion().takeBody(source.getBodyRegion());
+}
+
+static void commitFunctionClone(func::FuncOp destination,
+                                func::FuncOp source) {
+  Operation *destinationOp = destination.getOperation();
+  Operation *sourceOp = source.getOperation();
+
+  destinationOp->setLoc(sourceOp->getLoc());
+  destinationOp->setAttrs(sourceOp->getAttrs());
+  if (destinationOp->getPropertiesStorageSize() != 0)
+    destinationOp->copyProperties(sourceOp->getPropertiesStorage());
+  destination.getBody().takeBody(source.getBody());
+}
+
+struct FunctionBackup {
+  explicit FunctionBackup(func::FuncOp function)
+      : function(function), backup(function.clone()) {}
+
+  func::FuncOp function;
+  OwningOpRef<func::FuncOp> backup;
+};
+
+struct CandidateState {
+  FunctionBackup *functionBackup;
+  scf::ForOp loop;
+};
+
+static void restoreFunction(FunctionBackup &state) {
+  commitFunctionClone(state.function, *state.backup);
+}
+
+static void restoreAndRefreshFunctionBackup(FunctionBackup &state) {
+  restoreFunction(state);
+  state.backup = OwningOpRef<func::FuncOp>(state.function.clone());
 }
 // ============================================================================
 // Pass entry point
@@ -363,14 +414,53 @@ public:
     moduleOp.print(llvm::errs());
     llvm::errs() << "\n[cv-split] === END IR DUMP BEFORE ===\n\n";
 
-    moduleOp.walk([&](func::FuncOp funcOp) {
-      processFunction(funcOp);
-    });
+    // Run the transformation transactionally on one clone of the input module.
+    // Each function has its own backup, so a failed candidate can be restored
+    // without discarding successful candidates in other functions.
+    OwningOpRef<ModuleOp> transformedModule = moduleOp.clone();
+    SmallVector<FunctionBackup> functionBackups;
+    for (func::FuncOp funcOp : transformedModule->getOps<func::FuncOp>())
+      functionBackups.emplace_back(funcOp);
+
+    SmallVector<CandidateState> candidates =
+        prepareCandidates(functionBackups);
+    llvm::errs() << "[cv-split] Functions: " << functionBackups.size()
+                 << ", prepared candidates: " << candidates.size() << "\n";
+    if (candidates.empty()) {
+      llvm::errs() << "[cv-split] No candidate found; keeping original IR\n";
+      return;
+    }
+
+    // Stage 3: DCVP remains unchanged and classifies the whole working module
+    // exactly once. Non-candidate functions are restored immediately afterward
+    // so classifier-side rewrites cannot leak into them.
+    if (failed(cv_split::runDCVPClassifier(*transformedModule))) {
+      llvm::errs() << "[cv-split] DCVP classification failed; keeping original "
+                      "IR\n";
+      return;
+    }
+    restoreNonCandidates(functionBackups, candidates);
+
+    // Stages 4 onward: finish every prepared candidate independently. A failed
+    // function is restored from its original backup and processing continues.
+    if (!processCandidates(candidates)) {
+      llvm::errs() << "[cv-split] No candidate transformed; keeping original "
+                      "IR\n";
+      return;
+    }
 
     // Safety cleanup for functions that returned before the normal Stage 8
     // cleanup point.
-    removeUnrollOriginIdAttrs(moduleOp);
-    cv_split::removeDCVPClassificationAttrs(moduleOp);
+    removeUnrollOriginIdAttrs(*transformedModule);
+    cv_split::removeDCVPClassificationAttrs(*transformedModule);
+
+    if (failed(verify(*transformedModule))) {
+      llvm::errs() << "[cv-split] Transformed IR failed verification; keeping "
+                      "original IR\n";
+      return;
+    }
+
+    commitModuleClone(moduleOp, *transformedModule);
 
     llvm::errs() << "\n[cv-split] ============================\n"
                  << "[cv-split]  CVSplitScheduling END\n"
@@ -383,21 +473,62 @@ public:
   }
 
 private:
-  void processFunction(func::FuncOp funcOp) {
-    llvm::errs() << "[cv-split] Function: " << funcOp.getName() << "\n";
+  SmallVector<CandidateState>
+  prepareCandidates(MutableArrayRef<FunctionBackup> functionBackups) {
+    SmallVector<CandidateState> candidates;
+    for (FunctionBackup &state : functionBackups) {
+      llvm::errs() << "[cv-split] Function: " << state.function.getName()
+                   << "\n";
+      FailureOr<scf::ForOp> preCheckResult =
+          preCheckCVSplitScheduling(state.function, unrollFactor);
+      if (failed(preCheckResult)) {
+        llvm::errs() << "[cv-split] Pre-check rejected function, skip\n";
+        continue;
+      }
 
-    // Stage 1: pre-check conditions, and return innermost for loop
-    FailureOr<scf::ForOp> preCheckResult =
-        preCheckCVSplitScheduling(funcOp, unrollFactor);
-    if (failed(preCheckResult)) {
-      llvm::errs() << "[cv-split] Pre-check rejected function, skip\n";
-      return;
+      scf::ForOp candidateLoop = *preCheckResult;
+      llvm::errs() << "[cv-split] Pre-check accepted candidate loop\n";
+      if (failed(unrollCandidateLoop(state.function, candidateLoop))) {
+        llvm::errs() << "[cv-split] Candidate preparation failed; trying "
+                        "next function\n";
+        restoreAndRefreshFunctionBackup(state);
+        continue;
+      }
+
+      candidates.push_back({&state, candidateLoop});
     }
+    return candidates;
+  }
 
-    // this is the unroll candidate
-    scf::ForOp loop = *preCheckResult;
-    llvm::errs() << "[cv-split] Pre-check accepted candidate loop\n";
+  static void
+  restoreNonCandidates(MutableArrayRef<FunctionBackup> functionBackups,
+                       ArrayRef<CandidateState> candidates) {
+    llvm::DenseSet<Operation *> candidateFunctions;
+    for (const CandidateState &candidate : candidates)
+      candidateFunctions.insert(candidate.functionBackup->function);
 
+    for (FunctionBackup &state : functionBackups)
+      if (!candidateFunctions.contains(state.function))
+        restoreFunction(state);
+  }
+
+  bool processCandidates(MutableArrayRef<CandidateState> candidates) {
+    bool transformedAnyCandidate = false;
+    for (CandidateState &candidate : candidates) {
+      FunctionBackup &state = *candidate.functionBackup;
+      if (failed(processFunction(state.function, candidate.loop)) ||
+          failed(verify(state.function))) {
+        llvm::errs() << "[cv-split] Candidate failed; restoring function and "
+                        "trying next function\n";
+        restoreFunction(state);
+        continue;
+      }
+      transformedAnyCandidate = true;
+    }
+    return transformedAnyCandidate;
+  }
+
+  LogicalResult unrollCandidateLoop(func::FuncOp funcOp, scf::ForOp loop) {
     ModuleOp module = funcOp->getParentOfType<ModuleOp>();
     dumpOriginTagIR(module, "before_tag.mlir");
     tagUnrollOriginIds(loop);
@@ -407,32 +538,36 @@ private:
     LogicalResult unrollResult = loopUnrollByFactor(loop, unrollFactor);
     if (failed(unrollResult)) {
       llvm::errs() << "[cv-split] Unroll failed, bail\n";
-      return;
+      return failure();
     }
     llvm::errs() << "[cv-split] Unrolled by " << unrollFactor << "\n";
+    return success();
+  }
 
+  LogicalResult processFunction(func::FuncOp funcOp, scf::ForOp loop) {
     Block *body = loop.getBody();
 
-    // Stage 3: Classification
+    // Stage 3: Import the classifications stamped by the single module-level
+    // DCVP classifier invocation in runOnOperation().
     FailureOr<cv_split::Classification> classificationResult =
-        cv_split::classifyAllOpsWithDCVP(module, body);
+        cv_split::readDCVPClassification(body);
     if (failed(classificationResult)) {
-      llvm::errs() << "[cv-split] DCVP classification failed, bail\n";
-      return;
+      llvm::errs() << "[cv-split] Failed to read DCVP classification, bail\n";
+      return failure();
     }
     cv_split::Classification classification =
         std::move(*classificationResult);
     if (!cv_split::checkCoreClassifications(body, classification)) {
       llvm::errs() << "[cv-split] Loop must contain both CUBE and VECTOR ops, "
                       "skip\n";
-      return;
+      return failure();
     }
 
     // Stages 4-7: build the dependency graph, assign BFS levels, verify the
     // CUBE/VECTOR work is cleanly separable, and reorder the body by level.
     cv_split::DependencyScheduler scheduler;
     if (!scheduler.run(body, classification))
-      return;
+      return failure();
 
     // Dump IR before scope separation
     llvm::errs() << "[cv-split] === IR BEFORE SCOPE SEPARATION ===\n";
@@ -440,15 +575,15 @@ private:
     llvm::errs() << "\n[cv-split] === END IR BEFORE ===\n\n";
 
     // Stage 7.5: Unfuse PV matmuls (split matmul(p,v,acc*alpha) into pv + addf)
-    cv_split::unfusePVMatmuls(body, classification);
+    if (failed(cv_split::unfusePVMatmuls(body, classification)))
+      return failure();
 
     // Stage 8: Insert cross-scope transfers (BEFORE scope separation)
     llvm::errs() << "[cv-split] === Stage 8: cross-scope transfers ===\n";
     FailureOr<cv_split::CrossScopeTransferInfo> transferInfo =
         cv_split::insertCrossScopeTransfers(loop, classification);
     if (failed(transferInfo)) {
-      signalPassFailure();
-      return;
+      return failure();
     }
     // Origin IDs are temporary unroll-lineage metadata. Transfer grouping is
     // their final consumer, so do not expose them to scope/backend passes.
@@ -464,15 +599,15 @@ private:
     llvm::errs() << "[cv-split] === Stage 9: scope separation ===\n";
     if (failed(cv_split::createScopeSeparation(funcOp, loop, classification,
                                                *transferInfo))) {
-      signalPassFailure();
-      return;
+      return failure();
     }
     llvm::errs() << "[cv-split] Stage 9 complete\n";
 
     // Stage 11.5: bind the loop-invariant matmul LHS (Q) into a cbuf buffer so
     // the QK matmul reads an aligned NZ L1 operand (matches the manual kernel
     // and avoids the misaligned implicit GM/UB->L1 stage of a plain memref).
-    bindLoopInvariantMatmulLhsToCbuf(funcOp);
+    if (failed(bindLoopInvariantMatmulLhsToCbuf(funcOp)))
+      return failure();
 
     // Stage 10: Ensure function has mix_mode attribute (it should already)
     // Note: do NOT add hivm.func_core_type=MIX — that triggers SplitMixKernel
@@ -494,6 +629,7 @@ private:
     llvm::errs() << "[cv-split] === FUNCTION IR AFTER SCOPE SEPARATION ===\n";
     funcOp.print(llvm::errs());
     llvm::errs() << "\n[cv-split] === END FUNCTION IR ===\n";
+    return success();
   }
 };
 

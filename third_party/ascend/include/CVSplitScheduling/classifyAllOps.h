@@ -15,9 +15,12 @@ using Classification = llvm::DenseMap<Operation *, EngineType>;
 /// emitted by DynamicCVPipeline's classifier.
 void setOpEngineTypeAttr(Operation *op, EngineType engineType);
 
-/// Runs DynamicCVPipeline's operation classifier on the module, then imports
-/// the classifications for operations directly contained in `body`.
-FailureOr<Classification> classifyAllOpsWithDCVP(ModuleOp module, Block *body);
+/// Runs DynamicCVPipeline's operation classifier once on `module`.
+LogicalResult runDCVPClassifier(ModuleOp module);
+
+/// Imports the DCVP classifications already stamped on operations directly
+/// contained in `body`.
+FailureOr<Classification> readDCVPClassification(Block *body);
 
 /// Logs the candidate body's classifications and returns true when both the
 /// CUBE and VECTOR subcores have work.

@@ -2,16 +2,27 @@
 // RUN: triton-opt %s "--cv_split_scheduling=compile-on-910-95=true unroll-factor=4" 2>&1 >/dev/null | FileCheck %s --check-prefix=DIAG
 
 // DIAG-LABEL: [cv-split] Function: cube_only
+// DIAG-LABEL: [cv-split] Function: vector_only
 // DIAG: [cv-split] Classification: 4C 0V
 // DIAG: [cv-split] Loop must contain both CUBE and VECTOR ops, skip
-// DIAG-LABEL: [cv-split] Function: vector_only
+// DIAG: [cv-split] Candidate failed; restoring function and trying next function
 // DIAG: [cv-split] Classification: 0C 4V
 // DIAG: [cv-split] Loop must contain both CUBE and VECTOR ops, skip
+// DIAG: [cv-split] Candidate failed; restoring function and trying next function
+// DIAG: [cv-split] No candidate transformed; keeping original IR
 
 // IR-NOT: ssbuffer.core_type
 // IR-LABEL: func.func @cube_only
+// IR: %[[CUBE_STEP:.*]] = arith.constant 1 : index
+// IR: scf.for %{{.*}} = %{{.*}} to %{{.*}} step %[[CUBE_STEP]] {
+// IR-NEXT: %{{.*}} = linalg.matmul
+// IR-NEXT: }
 // IR-NOT: scope.scope
 // IR-LABEL: func.func @vector_only
+// IR: %[[VECTOR_STEP:.*]] = arith.constant 1 : index
+// IR: scf.for %{{.*}} = %{{.*}} to %{{.*}} step %[[VECTOR_STEP]] {
+// IR-NEXT: %{{.*}} = arith.addf
+// IR-NEXT: }
 // IR-NOT: scope.scope
 
 module attributes {hacc.target = #hacc.target<"Ascend950PR_9589">} {

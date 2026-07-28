@@ -6,8 +6,6 @@
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/raw_ostream.h"
 
-#include <cassert>
-
 namespace mlir::triton::cv_split {
 
 // Split matmul(p, v, acc * alpha) into two operations:
@@ -15,7 +13,7 @@ namespace mlir::triton::cv_split {
 // This is needed because triton's combine pass fuses arith.addf(matmul(...,0), x)
 // into matmul(..., x), creating an unresolvable CUBE→VECTOR→CUBE chain through
 // the accumulator. Unfusing makes the PV matmul independent of the accumulator.
-void unfusePVMatmuls(Block *body, Classification &classification) {
+LogicalResult unfusePVMatmuls(Block *body, Classification &classification) {
   SmallVector<linalg::MatmulOp> toUnfuse;
   for (Operation &op : *body) {
     auto matmulOp = dyn_cast<linalg::MatmulOp>(&op);
@@ -30,8 +28,11 @@ void unfusePVMatmuls(Block *body, Classification &classification) {
     if (!outsDef || outsDef->getBlock() != body)
       continue;
     auto outsClassIt = classification.find(outsDef);
-    assert(outsClassIt != classification.end() &&
-           "body operation must have a classification");
+    if (outsClassIt == classification.end()) {
+      matmulOp.emitError(
+          "missing classification for matmul accumulator producer");
+      return failure();
+    }
     if (outsClassIt->second != EngineType::VECTOR)
       continue;
 
@@ -40,7 +41,7 @@ void unfusePVMatmuls(Block *body, Classification &classification) {
   }
 
   if (toUnfuse.empty())
-    return;
+    return success();
 
   llvm::errs() << "[cv-split] Unfusing " << toUnfuse.size()
                << " PV matmuls with VECTOR outs\n";
@@ -50,7 +51,11 @@ void unfusePVMatmuls(Block *body, Classification &classification) {
     Location loc = matmulOp.getLoc();
 
     Value outsVal = matmulOp.getDpsInitOperand(0)->get();
-    auto outsType = cast<RankedTensorType>(outsVal.getType());
+    auto outsType = dyn_cast<RankedTensorType>(outsVal.getType());
+    if (!outsType) {
+      matmulOp.emitError("expected a ranked tensor matmul accumulator");
+      return failure();
+    }
 
     // Create zero init tensor
     auto zeroAttr = builder.getZeroAttr(outsType.getElementType());
@@ -74,6 +79,8 @@ void unfusePVMatmuls(Block *body, Classification &classification) {
     setOpEngineTypeAttr(zeroConst, EngineType::CUBE);
     setOpEngineTypeAttr(addOp, EngineType::VECTOR);
   }
+
+  return success();
 }
 
 } // namespace mlir::triton::cv_split

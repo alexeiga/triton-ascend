@@ -5,7 +5,7 @@
 
 namespace mlir::triton::cv_split {
 
-void unfusePVMatmuls(Block *body, Classification &classification);
+LogicalResult unfusePVMatmuls(Block *body, Classification &classification);
 
 } // namespace mlir::triton::cv_split
 
