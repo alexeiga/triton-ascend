@@ -37,11 +37,15 @@ module attributes {hacc.target = #hacc.target<"Ascend950PR_9589">} {
   }
 
   func.func @second_candidate_succeeds(
-      %lhs: tensor<32x16xf16>, %rhs: tensor<16x16xf16>,
+      %lhs_src: memref<32x16xf16>, %rhs: tensor<16x16xf16>,
       %init: tensor<32x16xf32>) {
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
     %c16 = arith.constant 16 : index
+    %lhs_buffer = memref.alloc() : memref<32x16xf16>
+    memref.copy %lhs_src, %lhs_buffer : memref<32x16xf16> to memref<32x16xf16>
+    %lhs = bufferization.to_tensor %lhs_buffer restrict writable :
+        memref<32x16xf16>
     scf.for %iv = %c0 to %c16 step %c1 {
       %matmul = linalg.matmul
           ins(%lhs, %rhs : tensor<32x16xf16>, tensor<16x16xf16>)

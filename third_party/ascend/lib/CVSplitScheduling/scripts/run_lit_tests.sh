@@ -9,6 +9,7 @@ MIXED_CORE_TEST="$REPO/third_party/ascend/unittest/Conversion/General/CVSplitSch
 FA_TEST="$REPO/third_party/ascend/unittest/Conversion/General/CVSplitScheduling/cv_split_scheduling_fa.mlir"
 SCOPE_HOISTING_TEST="$REPO/third_party/ascend/unittest/Conversion/General/CVSplitScheduling/cv_split_scope_hoisting.mlir"
 ROLLBACK_TEST="$REPO/third_party/ascend/unittest/Conversion/General/CVSplitScheduling/cv_split_transaction_rollback.mlir"
+LATE_ROLLBACK_TEST="$REPO/third_party/ascend/unittest/Conversion/General/CVSplitScheduling/cv_split_late_rollback.mlir"
 CANDIDATE_FALLBACK_TEST="$REPO/third_party/ascend/unittest/Conversion/General/CVSplitScheduling/cv_split_candidate_fallback.mlir"
 NESTED_CANDIDATE_TEST="$REPO/third_party/ascend/unittest/Conversion/General/CVSplitScheduling/cv_split_nested_candidate.mlir"
 VERBOSE=false
@@ -215,6 +216,26 @@ if ! "$FC" "$ROLLBACK_TEST" --check-prefix=DIAG <"$ROLLBACK_LOG"; then
 fi
 show_log_if_verbose "$ROLLBACK_LOG"
 echo "    PASS: restored original IR after a late Stage-8 failure"
+
+echo ">>> CVSplit late rollback lit tests"
+run_stdout_filecheck "$LATE_ROLLBACK_TEST" 4 \
+  "$TMP_DIR/late-rollback-ir.log" --check-prefix=IR
+LATE_ROLLBACK_LOG="$TMP_DIR/late-rollback-diag.log"
+if ! "$OPT" "$LATE_ROLLBACK_TEST" \
+    "--cv_split_scheduling=compile-on-910-95=true unroll-factor=4" \
+    >/dev/null 2>"$LATE_ROLLBACK_LOG"; then
+  echo "    triton-opt diagnostics:" >&2
+  filter_ir_dumps <"$LATE_ROLLBACK_LOG" >&2
+  exit 1
+fi
+if ! "$FC" "$LATE_ROLLBACK_TEST" --check-prefix=DIAG \
+    <"$LATE_ROLLBACK_LOG"; then
+  echo "    triton-opt diagnostics:" >&2
+  filter_ir_dumps <"$LATE_ROLLBACK_LOG" >&2
+  exit 1
+fi
+show_log_if_verbose "$LATE_ROLLBACK_LOG"
+echo "    PASS: restored original IR after Stage-9, Q-staging, and verifier failures"
 
 echo ">>> CVSplit per-candidate fallback lit test"
 run_stdout_filecheck "$CANDIDATE_FALLBACK_TEST" 4 \
