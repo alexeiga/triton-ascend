@@ -71,8 +71,8 @@ using namespace mlir::triton;
 //   2.  loopUnrollByFactor           unroll by `unroll-factor` to expose ILP
 //   3.  classifyAllOps               tag each op CUBE or VECTOR (matmul-seeded,
 //                                    data-feeders pulled into CUBE, rest VECTOR)
-//   4-7 DependencyScheduler          graph -> BFS levels -> purity check ->
-//                                    reorder so same-engine work is contiguous
+//   4-7 DependencyScheduler          graph -> BFS levels -> reorder so
+//                                    same-engine work is contiguous
 //   7.5 unfusePVMatmuls              undo matmul(p,v,acc) fusion that entangles
 //                                    the engines
 //   8.  insertCrossScopeTransfers    materialize C->V (fixpipe->UB) and V->C
@@ -566,7 +566,7 @@ private:
     // Stages 4-7: build the dependency graph, assign BFS levels, verify the
     // CUBE/VECTOR work is cleanly separable, and reorder the body by level.
     cv_split::DependencyScheduler scheduler;
-    if (!scheduler.run(body, classification))
+    if (failed(scheduler.run(body, classification)))
       return failure();
 
     // Dump IR before scope separation

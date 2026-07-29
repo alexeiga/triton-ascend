@@ -55,16 +55,16 @@ static void buildDependencyGraph(
   // (This is already captured by SSA edges since copy USES the source value.)
 }
 
-static bool validateDependencyGraph(
+static LogicalResult validateDependencyGraph(
     const DenseMap<Operation *, SmallVector<Operation *>> &predecessors) {
   for (const auto &entry : predecessors) {
     if (entry.second.empty()) {
       llvm::errs() << "[cv-split] Invalid empty predecessor entry for "
                    << entry.first->getName() << ", bail\n";
-      return false;
+      return failure();
     }
   }
-  return true;
+  return success();
 }
 
 // ============================================================================
@@ -132,7 +132,7 @@ static int assignDependencyLevels(
   return maxLevel;
 }
 
-static bool verifyDependencyLevels(
+static LogicalResult verifyDependencyLevels(
     Block *body, const DenseMap<Operation *, int> &levels) {
   for (Operation &op : *body) {
     if (isa<scf::YieldOp>(&op))
@@ -140,10 +140,10 @@ static bool verifyDependencyLevels(
     if (!levels.count(&op)) {
       llvm::errs() << "[cv-split] No dependency level assigned to " << op.getName()
                    << "; dependency graph may contain a cycle, bail\n";
-      return false;
+      return failure();
     }
   }
-  return true;
+  return success();
 }
 
 // ============================================================================
@@ -204,28 +204,28 @@ static void reorderByLevel(Block *body,
 //   3. report the per-level CUBE/VECTOR distribution,
 //   4. reorder the body by level, ready to be
 //      split into a CUBE scope and a VECTOR scope.
-// run() returns false when dependency levels cannot be assigned to every op.
+// run() fails when dependency levels cannot be assigned to every op.
 // ============================================================================
-bool DependencyScheduler::run(
+LogicalResult DependencyScheduler::run(
     Block *body,
     const DenseMap<Operation *, EngineType> &classification) {
   buildDependencyGraph(body, predecessors, successors);
-  if (!validateDependencyGraph(predecessors))
-    return false;
+  if (failed(validateDependencyGraph(predecessors)))
+    return failure();
 
   SmallVector<Operation *> roots = collectRoots(body, predecessors);
   llvm::errs() << "[cv-split] " << roots.size() << " roots\n";
 
   maxLevel = assignDependencyLevels(body, predecessors, roots, levels);
-  if (!verifyDependencyLevels(body, levels))
-    return false;
+  if (failed(verifyDependencyLevels(body, levels)))
+    return failure();
   llvm::errs() << "[cv-split] " << (maxLevel + 1) << " dependency levels\n";
 
   logLevelHistogram(body, levels, classification, maxLevel);
 
   reorderByLevel(body, levels);
   llvm::errs() << "[cv-split] Reordered by level\n";
-  return true;
+  return success();
 }
 
 } // namespace mlir::triton::cv_split

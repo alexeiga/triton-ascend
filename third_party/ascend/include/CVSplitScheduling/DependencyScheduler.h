@@ -3,6 +3,7 @@
 
 #include "ascend/include/CVSplitScheduling/classifyAllOps.h"
 #include "mlir/IR/Block.h"
+#include "mlir/Support/LogicalResult.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
 
@@ -10,8 +11,9 @@ namespace mlir::triton::cv_split {
 
 class DependencyScheduler {
 public:
-  bool run(Block *body,
-           const llvm::DenseMap<Operation *, EngineType> &classification);
+  LogicalResult run(
+      Block *body,
+      const llvm::DenseMap<Operation *, EngineType> &classification);
 
 private:
   llvm::DenseMap<Operation *, llvm::SmallVector<Operation *>> predecessors;
