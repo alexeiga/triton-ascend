@@ -2,6 +2,7 @@
 #include "ascend/include/CVSplitScheduling/CrossScopeTransfers.h"
 #include "ascend/include/CVSplitScheduling/DependencyScheduler.h"
 #include "ascend/include/CVSplitScheduling/PreCheck.h"
+#include "ascend/include/CVSplitScheduling/QStaging.h"
 #include "ascend/include/CVSplitScheduling/ScopeSeparation.h"
 #include "ascend/include/CVSplitScheduling/UnrollOrigin.h"
 #include "ascend/include/CVSplitScheduling/UnfusePVMatmuls.h"
@@ -10,9 +11,6 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/SCF/Utils/Utils.h"
-#include "mlir/Dialect/Linalg/IR/Linalg.h"
-#include "mlir/Dialect/MemRef/IR/MemRef.h"
-#include "mlir/Dialect/Bufferization/IR/Bufferization.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Math/IR/Math.h"
@@ -24,16 +22,12 @@
 #include "mlir/IR/IRMapping.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/IR/Verifier.h"
-#include "bishengir/Dialect/HIVM/IR/HIVM.h"
-#include "bishengir/Dialect/Scope/IR/Scope.h"
-#include "bishengir/Dialect/Annotation/IR/Annotation.h"
 #include "bishengir/Dialect/HACC/IR/HACC.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/SetVector.h"
-#include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/FileSystem.h"
@@ -137,209 +131,6 @@ static void tagUnrollOriginIds(scf::ForOp loop) {
 static void removeUnrollOriginIdAttrs(Operation *root) {
   root->walk(
       [](Operation *op) { op->removeAttr(kUnrollOriginIdAttrName); });
-}
-
-// ============================================================================
-// Stage 11.5: Bind the loop-invariant matmul LHS (Q in flash-attention) into a
-// dedicated L1 (cbuf) buffer, matching the manual kernel.
-//
-// In the manual kernel Q is staged once into a persistent cbuf buffer
-// (mem_unique) and the QK matmul reads it directly from L1:
-//   %alloc_q = memref.alloc() : memref<MxKxf16, cbuf>
-//   annotation.mark %alloc_q {mem_unique}
-//   annotation.mark %alloc_q {effects = ["write","read"]}
-//   annotation.mark %q keys = ["bind_buffer"] values = [%alloc_q : cbuf]
-//
-// Without this, our QK matmul reads Q from a loop-invariant *plain* memref and
-// BiShengIR inserts an implicit GM/UB->L1 stage whose descriptor is misaligned
-// (runtime fixp_addr_misal / zero-burst MOV_SRC_TO_FB on the cube). Binding Q to
-// a cbuf buffer (as the manual does) gives the matmul an aligned NZ L1 operand.
-//
-// We target only the loop-invariant LHS (defined OUTSIDE the innermost loop):
-// that is Q for QK. The PV matmul LHS (P) is loop-variant (produced by the
-// vector scope) and already lives in cbuf via convert_layout, so it is skipped.
-static LogicalResult bindLoopInvariantMatmulLhsToCbuf(func::FuncOp funcOp) {
-  // Map each distinct loop-invariant LHS value to the CUBE scope that consumes
-  // it. The alloc + bind must live INSIDE that scope (before its loop) so the
-  // whole Q-staging is self-contained on the cube/AIC side after the MIX split
-  // — placing it at function level breaks dominance in buildFinalHIVMPipelines.
-  llvm::MapVector<Value, scope::ScopeOp> lhsToScope;
-  funcOp.walk([&](Operation *op) {
-    Value lhs;
-    if (auto m = dyn_cast<linalg::MatmulTransposeBOp>(op))
-      lhs = m.getInputs()[0];
-    else if (auto m = dyn_cast<linalg::MatmulOp>(op))
-      lhs = m.getInputs()[0];
-    else
-      return;
-
-    auto tt = dyn_cast<RankedTensorType>(lhs.getType());
-    if (!tt || tt.getRank() != 2 || !tt.getElementType().isF16())
-      return;
-
-    Operation *def = lhs.getDefiningOp();
-    if (!def)
-      return; // block argument: not a stage-able buffer
-
-    auto enclosingFor = op->getParentOfType<scf::ForOp>();
-    if (!enclosingFor)
-      return;
-    // Loop-variant LHS (e.g. P, produced inside the loop) -> already cbuf-backed.
-    if (enclosingFor->isProperAncestor(def))
-      return;
-
-    auto cubeScope = op->getParentOfType<scope::ScopeOp>();
-    if (!cubeScope)
-      return; // only handle matmuls that ended up inside a scope
-    // The LHS def must dominate the scope (it is defined before/outside it).
-    if (cubeScope->isProperAncestor(def))
-      return;
-
-    if (!lhsToScope.count(lhs))
-      lhsToScope.insert({lhs, cubeScope});
-  });
-
-  for (auto &kv : lhsToScope) {
-    Value q = kv.first;
-    scope::ScopeOp cubeScope = kv.second;
-    Block *scopeBody = &cubeScope.getBodyRegion().front();
-
-    // GM source behind Q. We re-load Q from global memory INSIDE the cube scope
-    // (matching the manual): GM -> fresh plain buffer -> bind to cbuf. Binding a
-    // value captured from outside the scope breaks dominance after the MIX
-    // split, and copying from Q's existing (now-cbuf-bound) staging buffer would
-    // lower to an unsupported cbuf->cbuf copy. Copying straight from the GM
-    // reinterpret_cast avoids both.
-    Value srcMemref;
-    if (auto toTensor = q.getDefiningOp<bufferization::ToTensorOp>()) {
-      Value qMem = toTensor.getMemref();
-      // Trace back through the GM->staging memref.copy to the GM source.
-      for (Operation *user : qMem.getUsers()) {
-        if (auto cp = dyn_cast<memref::CopyOp>(user)) {
-          if (cp.getTarget() == qMem) {
-            srcMemref = cp.getSource();
-            break;
-          }
-        }
-      }
-    }
-    if (!srcMemref) {
-      funcOp.emitError("failed to find the GM source for a loop-invariant "
-                       "matmul LHS");
-      return failure();
-    }
-
-    OpBuilder builder(cubeScope.getContext());
-    Location loc = q.getLoc();
-    auto tt = cast<RankedTensorType>(q.getType());
-
-    // Persistent cbuf buffer for Q (mem_unique). It MUST be allocated at
-    // FUNCTION scope (before the CUBE scope), alongside the P/V cbuf buffers,
-    // NOT inside the cube scope. SplitMixKernel clones the function into an AIC
-    // and an AIV part and drops each scope's body from the other clone; if the
-    // Q cbuf alloc lives inside the CUBE scope it vanishes from the AIV clone,
-    // the two clones then disagree on cbuf (L1) layout, and the cross-engine P
-    // buffer lands at mismatched L1 addresses in the cube vs vector code -> the
-    // matmul's L1->FB operand load reads a misaligned address (degenerate
-    // MOV_SRC_TO_FB, fixp_addr_misal at runtime). Hoisting it to function scope
-    // (matching the manual kernel) keeps the L1 layout identical in both clones.
-    //
-    // It must also be the FIRST cbuf buffer (before the P/V NZ buffers), matching
-    // the manual's Q,P,V order: PlanMemory lays cbuf out in allocation order, and
-    // the QK matmul reads Q from L1 into the cube feature buffer. If Q lands at a
-    // large L1 offset (P+V before it ~= 64 KB) the offset no longer fits the FB
-    // load's immediate offset field, so hivmc emits offset mode 2 (register
-    // offset) which the simulator's dmamov_decode_to_fb rejects ("Invalid offset
-    // mode: 2"). Placing Q first keeps it at L1 offset 0.
-    Operation *firstCbufAlloc = nullptr;
-    for (Operation &o : *cubeScope->getBlock()) {
-      auto a = dyn_cast<memref::AllocOp>(&o);
-      if (!a)
-        continue;
-      auto mt = dyn_cast<MemRefType>(a.getType());
-      if (!mt)
-        continue;
-      auto as = dyn_cast_or_null<hivm::AddressSpaceAttr>(mt.getMemorySpace());
-      if (as && as.getAddressSpace() == hivm::AddressSpace::L1) {
-        firstCbufAlloc = &o;
-        break;
-      }
-    }
-    if (firstCbufAlloc)
-      builder.setInsertionPoint(firstCbufAlloc);
-    else
-      builder.setInsertionPoint(cubeScope);
-    auto cbufAS = builder.getAttr<hivm::AddressSpaceAttr>(hivm::AddressSpace::L1);
-    auto cbufType =
-        MemRefType::get(tt.getShape(), tt.getElementType(), nullptr, cbufAS);
-    auto cbufAlloc = builder.create<memref::AllocOp>(loc, cbufType);
-
-    auto muMark = builder.create<annotation::MarkOp>(loc, cbufAlloc.getResult());
-    muMark->setAttr("mem_unique", builder.getUnitAttr());
-
-    auto effMark = builder.create<annotation::MarkOp>(loc, cbufAlloc.getResult());
-    effMark->setAttr("effects", builder.getArrayAttr({builder.getStringAttr("write"),
-                                                      builder.getStringAttr("read")}));
-
-    // Everything below (the fresh Q load, bind_buffer, cbuf read view, matmul
-    // operand rewrite) stays INSIDE the cube scope — those are cube-only and
-    // correctly dropped from the AIV clone.
-    builder.setInsertionPointToStart(scopeBody);
-
-    // Fresh in-scope Q load (plain memref) + to_tensor, then bind it to the
-    // cbuf buffer (this fills the persistent cbuf with Q, kept ND [M,K]).
-    auto plainType = MemRefType::get(tt.getShape(), tt.getElementType());
-    auto qAlloc = builder.create<memref::AllocOp>(loc, plainType);
-    builder.create<memref::CopyOp>(loc, srcMemref, qAlloc.getResult());
-    auto qBindTensor = builder.create<bufferization::ToTensorOp>(
-        loc, tt, qAlloc.getResult(), /*restrict=*/true, /*writable=*/true);
-
-    builder.create<annotation::MarkOp>(loc, qBindTensor.getResult(),
-                                       ValueRange{cbufAlloc.getResult()},
-                                       builder.getStrArrayAttr({"bind_buffer"}));
-
-    // Read Q back from the cbuf buffer via memory_space_cast for the matmul
-    // operand — matching the manual kernel (and our P operand path). Feeding the
-    // bound plain tensor directly makes BiShengIR insert an nd2nz + multi_buffer
-    // for Q (loop-invariant Q must NOT be double-buffered), which overflows UB.
-    // A plain cbuf->ND memory_space_cast read keeps Q single-buffered ND [M,K].
-    auto qCastView = builder.create<memref::MemorySpaceCastOp>(
-        loc, plainType, cbufAlloc.getResult());
-    auto qReadTensor = builder.create<bufferization::ToTensorOp>(
-        loc, tt, qCastView.getResult(), /*restrict=*/true, /*writable=*/true);
-
-    // Rewrite Q uses inside the cube scope (the QK matmuls) to the cbuf read.
-    q.replaceUsesWithIf(qReadTensor.getResult(), [&](OpOperand &use) {
-      Operation *owner = use.getOwner();
-      return cubeScope->isProperAncestor(owner);
-    });
-
-    // Drop the now-dead original (pre-loop) Q load chain so its UB staging
-    // buffer is reclaimed: the to_tensor, the GM->staging memref.copy, and the
-    // staging alloc. Keeping it would double Q's UB footprint (and the copy has
-    // side effects, so DCE will not remove it on its own).
-    if (auto origToTensor = q.getDefiningOp<bufferization::ToTensorOp>()) {
-      if (origToTensor->use_empty()) {
-        Value qMem = origToTensor.getMemref();
-        origToTensor->erase();
-        Operation *fillCopy = nullptr;
-        for (Operation *user : qMem.getUsers()) {
-          if (auto cp = dyn_cast<memref::CopyOp>(user))
-            if (cp.getTarget() == qMem) { fillCopy = cp; break; }
-        }
-        if (fillCopy)
-          fillCopy->erase();
-        if (Operation *allocDef = qMem.getDefiningOp())
-          if (isa<memref::AllocOp>(allocDef) && allocDef->use_empty())
-            allocDef->erase();
-      }
-    }
-
-    llvm::errs() << "[cv-split] Staged loop-invariant matmul LHS into cbuf "
-                 << tt << " (inside CUBE scope, bind_buffer)\n";
-  }
-
-  return success();
 }
 
 static void commitModuleClone(ModuleOp destination, ModuleOp source) {
@@ -606,7 +397,7 @@ private:
     // Stage 11.5: bind the loop-invariant matmul LHS (Q) into a cbuf buffer so
     // the QK matmul reads an aligned NZ L1 operand (matches the manual kernel
     // and avoids the misaligned implicit GM/UB->L1 stage of a plain memref).
-    if (failed(bindLoopInvariantMatmulLhsToCbuf(funcOp)))
+    if (failed(cv_split::bindLoopInvariantMatmulLhsToCbuf(funcOp)))
       return failure();
 
     // Stage 10: Ensure function has mix_mode attribute (it should already)
