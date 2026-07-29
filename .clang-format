@@ -8,7 +8,7 @@ BraceWrapping:
   AfterClass: false          # 类定义后不换行
   AfterControlStatement: MultiLine  # 控制语句后多行时换行
   AfterEnum: false           # 枚举定义后不换行
-  AfterFunction: true        # 函数定义后换行（K&R风格）
+  AfterFunction: false       # 函数定义的左大括号不另起一行（K&R风格）
   AfterNamespace: false      # 命名空间后不换行
   AfterObjCDeclaration: false
   AfterStruct: false         # 结构体定义后不换行
@@ -28,6 +28,8 @@ AllowShortBlocksOnASingleLine: Empty  # 只有空块可以放在一行
 AllowShortFunctionsOnASingleLine: Inline  # 内联函数可以放在一行
 AllowShortIfStatementsOnASingleLine: Never    # if语句不允许单行
 AllowShortLoopsOnASingleLine: false           # 循环不允许单行
+AllowAllParametersOfDeclarationOnNextLine: false
+BinPackParameters: OnePerLine
 
 # Lambda表达式配置
 LambdaBodyIndentation: Signature  # lambda体与签名对齐
@@ -46,11 +48,11 @@ SpaceBeforeCpp11BracedList: true   # 大括号列表前加空格
 SpaceInEmptyBlock: false           # 空块内不加空格
 
 # 缩进配置
-IndentWidth: 4                    # 缩进宽度
+IndentWidth: 2                    # 缩进宽度
 IndentCaseLabels: true      # case/default 相对于 switch 缩进
 IndentCaseBlocks: true      # case 块内的语句再缩进一层
-TabWidth: 4
+TabWidth: 2
 UseTab: Never                     # 不使用tab
 
 # 其他格式配置
-ColumnLimit: 120                   # 行宽限制
+ColumnLimit: 80                    # 行宽限制
